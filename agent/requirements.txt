@@ -1,0 +1,3 @@
+# cursord's own dependencies. Deliberately one line: the container talks HTTP
+# and shells out to git, and nothing it installs is expected to survive it.
+httpx>=0.27
