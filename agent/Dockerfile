@@ -1,6 +1,6 @@
 # The sandbox image. Build once, run one container per session epoch.
 #
-#   docker build -t cloud-agent-sandbox:dev sandbox/
+#   docker build -t cloud-agent-sandbox:dev agent/
 #
 # The image holds cursord and the tools the agent is likely to reach for.
 # Anything else the agent installs at runtime is rebuildable by definition:

@@ -2,7 +2,7 @@
 
 Companion to [local-cloud-agent-architecture.md](local-cloud-agent-architecture.md),
 which describes cursord in one paragraph. This is that paragraph expanded to
-the point where it can be built. Code sketch lives in `sandbox/`.
+the point where it can be built. Code sketch lives in `agent/`.
 
 ## What is in the container
 
@@ -106,7 +106,7 @@ epoch to say so.
 ## Running it
 
 ```bash
-docker build -t cloud-agent-sandbox:dev sandbox/
+docker build -t cloud-agent-sandbox:dev agent/
 export SANDBOX_IMAGE=cloud-agent-sandbox:dev
 ```
 
