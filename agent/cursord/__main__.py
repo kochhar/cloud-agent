@@ -77,6 +77,8 @@ async def work_loop(control: Control) -> None:
 
 
 async def main() -> int:
+    config.require()
+
     control = Control()
     heartbeat: asyncio.Task | None = None
     try:

@@ -1,9 +1,10 @@
 """The four tools, as they actually execute.
 
 cursord has no idea what any of this means. It receives a name and an args
-object, runs it, and reports what happened. The schemas the model sees live on
-the control plane; this is only the execution half, and the two have to be
-kept honest with each other by hand.
+object, runs it, and reports what happened. The schemas the model sees live in
+`control/tools.py`, which is the source of truth for names and argument
+spellings; this is only the execution half. The two halves ship in different
+images and cannot import each other, so `scripts/check_tools.py` compares them.
 
 Deliberately absent: anything git. Checkpointing owns the repository, and a
 model that can `git checkout` can undo a checkpoint out from under it.
@@ -16,7 +17,7 @@ import os
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from . import config
 
@@ -77,16 +78,23 @@ async def read_file(args: dict[str, Any]) -> ToolResult:
     path = _resolve(args["path"])
     if not path.is_file():
         raise ToolError(f"{args['path']}: no such file")
-    data = path.read_bytes()[: config.MAX_READ_BYTES]
+    data = path.read_bytes()
+    if len(data) > config.MAX_READ_BYTES:
+        # Say so, or the model reasons about a file it only partly saw.
+        return ToolResult(
+            output=data[: config.MAX_READ_BYTES].decode(errors="replace")
+            + f"\n\n... [truncated at {config.MAX_READ_BYTES} bytes of {len(data)}]"
+        )
     return ToolResult(output=data.decode(errors="replace"))
 
 
 async def write_file(args: dict[str, Any]) -> ToolResult:
     """Write full contents. Idempotent, which is what makes a re-run harmless."""
     path = _resolve(args["path"])
+    contents = args["contents"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(args["content"])
-    return ToolResult(output=f"wrote {len(args['content'])} bytes to {args['path']}")
+    path.write_text(contents)
+    return ToolResult(output=f"wrote {len(contents)} bytes to {args['path']}")
 
 
 async def list_files(args: dict[str, Any]) -> ToolResult:
@@ -118,7 +126,7 @@ async def run_command(args: dict[str, Any]) -> ToolResult:
     of accumulated shell state.
     """
     command = args["command"]
-    timeout = float(args.get("timeout") or config.COMMAND_TIMEOUT_SECONDS)
+    timeout = float(args.get("timeout_seconds") or config.COMMAND_TIMEOUT_SECONDS)
 
     process = await asyncio.create_subprocess_exec(
         "bash",
@@ -148,11 +156,27 @@ async def run_command(args: dict[str, Any]) -> ToolResult:
     )
 
 
+@dataclass(frozen=True)
+class Tool:
+    """A handler plus the argument names it answers to.
+
+    The names are spelled out rather than inferred because they are half of a
+    contract whose other half lives in `control/tools.py`, in a different
+    process and a different image. A rename on that side used to surface as a
+    tool failing every time the model called it, mid-session. Declared here,
+    `scripts/check_tools.py` catches it before anything is built.
+    """
+
+    handler: Callable[[dict[str, Any]], Awaitable[ToolResult]]
+    required: tuple[str, ...] = ()
+    optional: tuple[str, ...] = ()
+
+
 REGISTRY = {
-    "read_file": read_file,
-    "write_file": write_file,
-    "list_files": list_files,
-    "run_command": run_command,
+    "read_file": Tool(read_file, required=("path",)),
+    "write_file": Tool(write_file, required=("path", "contents")),
+    "list_files": Tool(list_files, optional=("path", "recursive")),
+    "run_command": Tool(run_command, required=("command",), optional=("timeout_seconds",)),
 }
 
 
@@ -163,14 +187,21 @@ async def execute(name: str, args: dict[str, Any]) -> ToolResult:
     conversation, and a sandbox that died because a tool threw would cost a
     whole epoch to say so.
     """
-    handler = REGISTRY.get(name)
-    if handler is None:
-        return ToolResult(output=f"unknown tool {name!r}", exit_code=1)
+    tool = REGISTRY.get(name)
+    if tool is None:
+        known = ", ".join(sorted(REGISTRY))
+        return ToolResult(output=f"unknown tool {name!r}; expected one of {known}", exit_code=1)
+
+    missing = [key for key in tool.required if args.get(key) is None]
+    if missing:
+        return ToolResult(
+            output="missing required argument(s): {}".format(", ".join(missing)),
+            exit_code=1,
+        )
+
     try:
-        return await handler(args)
+        return await tool.handler(args)
     except ToolError as exc:
         return ToolResult(output=str(exc), exit_code=1)
-    except KeyError as exc:
-        return ToolResult(output=f"missing required argument {exc}", exit_code=1)
     except Exception as exc:  # noqa: BLE001 - reported, not raised
         return ToolResult(output=f"{type(exc).__name__}: {exc}", exit_code=1)

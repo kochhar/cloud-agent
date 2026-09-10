@@ -13,11 +13,29 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # handed in by the spawner (control/sandbox.py::_start_container)
 # ---------------------------------------------------------------------------
-SESSION_ID = os.environ["SESSION_ID"]
-EPOCH = int(os.environ["EPOCH"])
-CONTROL_URL = os.environ["CONTROL_URL"].rstrip("/")
-REPO_URL = os.environ["REPO_URL"]
-BRANCH = os.environ["BRANCH"]
+# Read with defaults rather than demanded here, so that importing a cursord
+# module does not require a container's environment. `require()` does the
+# demanding, once, at startup. Without that split the tool registry cannot be
+# imported by anything on the control-plane side, including the contract check
+# that keeps the two halves of the tool surface in agreement.
+SESSION_ID = os.environ.get("SESSION_ID", "")
+EPOCH = int(os.environ.get("EPOCH") or 0)
+CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
+REPO_URL = os.environ.get("REPO_URL", "")
+BRANCH = os.environ.get("BRANCH", "")
+
+REQUIRED = ("SESSION_ID", "EPOCH", "CONTROL_URL", "REPO_URL", "BRANCH")
+
+
+def require() -> None:
+    """Refuse to start without the environment the spawner is meant to pass.
+
+    Failing here is cheap and legible. Failing later means a container that
+    registered, cloned, and then could not say where to push.
+    """
+    missing = [name for name in REQUIRED if not os.environ.get(name)]
+    if missing:
+        raise SystemExit("cursord: missing environment: " + ", ".join(missing))
 
 # ---------------------------------------------------------------------------
 # the filesystem
