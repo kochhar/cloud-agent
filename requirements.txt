@@ -1,0 +1,7 @@
+# Add dependencies here, then install with:
+#   .venv/bin/pip install -r requirements.txt
+
+fastapi>=0.115
+uvicorn>=0.30
+psycopg[binary]>=3.2
+pgserver==0.1.4
