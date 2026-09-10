@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from typing import Any, Optional
 
 import sessions
@@ -28,6 +29,29 @@ SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "")
 CONTROL_URL = os.environ.get("SANDBOX_CONTROL_URL", "http://host.docker.internal:8000")
 
 SPAWN_TIMEOUT_SECONDS = float(os.environ.get("SANDBOX_SPAWN_TIMEOUT", "60"))
+
+GIT_TIMEOUT_SECONDS = float(os.environ.get("SANDBOX_GIT_TIMEOUT", "30"))
+
+# How the container authenticates to a real git remote.
+#
+#   agent  forward the host's ssh-agent socket. The key never enters the
+#          container, so a model-authored `cat` cannot read it. The container
+#          can still *use* the key while it runs, which is unavoidable if it
+#          is to push at all.
+#   keys   bind-mount the key directory read-only. Simpler, and strictly
+#          worse: the private key is then a file inside a filesystem that
+#          arbitrary model-authored commands can read and exfiltrate. Only
+#          reasonable against a throwaway deploy key.
+#   none   no credentials. Correct for the local bare repo, which is reached
+#          by path rather than over the network.
+SSH_MODE = os.environ.get("SANDBOX_SSH_MODE", "agent")
+
+SSH_DIR = os.path.expanduser(os.environ.get("SANDBOX_SSH_DIR", "~/.ssh"))
+
+# Docker Desktop exposes the host's agent at a fixed path inside the VM; there
+# is no host socket to bind directly. On Linux the host socket is the real one.
+DESKTOP_SSH_SOCK = "/run/host-services/ssh-auth.sock"
+CONTAINER_SSH_SOCK = "/ssh-agent"
 
 
 class SpawnRefused(Exception):
@@ -94,6 +118,96 @@ def spawn(session_id: str) -> dict:
     }
 
 
+def register(session_id: str, epoch: int, container_id: str | None = None) -> dict:
+    """A sandbox announces itself. Returns what it needs to clone and check out.
+
+    Called once per epoch, either by the container spawn() started or by a
+    cursord run by hand against the same epoch. Re-registering is harmless:
+    a container that restarts inside its epoch lands on the same row.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            current = sessions._require_current_epoch(cur, session_id, epoch)
+            if epoch > current:
+                # Not stale but nonsense: no sandbox exists at an epoch the
+                # session has not reached.
+                raise SpawnRefused(
+                    f"epoch {epoch} is ahead of session {session_id} at epoch {current}"
+                )
+
+            cur.execute(
+                "SELECT repo_url, branch, base_sha, last_accepted_sha "
+                "FROM sessions WHERE id = %s",
+                (session_id,),
+            )
+            session = cur.fetchone()
+
+            # Resolved once, on the first registration, and left alone after
+            # that: the diff has to sit against where the work started, not
+            # against wherever the remote has moved to since.
+            base_sha = session["base_sha"] or _resolve_base_sha(session["repo_url"])
+            if base_sha and base_sha != session["base_sha"]:
+                cur.execute(
+                    "UPDATE sessions SET base_sha = %s, updated_at = now() WHERE id = %s",
+                    (base_sha, session_id),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO sandboxes
+                    (session_id, epoch, container_id, status, last_heartbeat_at)
+                VALUES (%s, %s, %s, 'ready', now())
+                ON CONFLICT (session_id, epoch) DO UPDATE
+                    SET status = 'ready',
+                        container_id = COALESCE(
+                            EXCLUDED.container_id, sandboxes.container_id),
+                        last_heartbeat_at = now()
+                """,
+                (session_id, epoch, container_id),
+            )
+
+            sessions._emit(cur, session_id, "sandbox_ready", {"epoch": epoch})
+
+    return {
+        "repo_url": session["repo_url"],
+        "branch": session["branch"],
+        "base_sha": base_sha,
+        # A replacement resumes from the last SHA the control plane accepted,
+        # not from whatever the dead sandbox managed to push before it went.
+        "resume_sha": session["last_accepted_sha"],
+        "epoch": epoch,
+    }
+
+
+def _resolve_base_sha(repo_url: str) -> Optional[str]:
+    """The head the work starts from, so there is something to diff against."""
+    if os.path.isdir(repo_url):
+        command = ["git", "-C", repo_url, "rev-parse", "HEAD"]
+    else:
+        command = ["git", "ls-remote", repo_url, "HEAD"]
+
+    try:
+        finished = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # Not fatal: registration still succeeds, but the diff will be empty
+        # until a base is known.
+        logger.warning(
+            "could not resolve base sha for %s: %s",
+            repo_url,
+            (getattr(exc, "stderr", "") or "").strip() or exc,
+        )
+        return None
+
+    fields = finished.stdout.split()
+    return fields[0] if fields else None
+
+
 def _refusal(cur, session_id: str) -> Exception:
     """Turn a no-op UPDATE into the reason it did not apply."""
     cur.execute("SELECT status FROM sessions WHERE id = %s", (session_id,))
@@ -101,6 +215,79 @@ def _refusal(cur, session_id: str) -> Exception:
     if row is None:
         return sessions.SessionNotFound(session_id)
     return SpawnRefused("session {} is {}".format(session_id, row["status"]))
+
+
+def _ssh_arguments() -> list:
+    """Docker arguments giving the container git access to a real remote.
+
+    Known hosts are mounted in every mode. Without them `StrictHostKeyChecking
+    =yes` refuses the connection, and with checking turned off instead the
+    container would accept any host key for the remote it pushes to.
+    """
+    if SSH_MODE == "none":
+        return []
+
+    if SSH_MODE == "keys":
+        # The whole directory, known_hosts included. The private key becomes
+        # readable by every command the model runs.
+        logger.warning(
+            "SANDBOX_SSH_MODE=keys mounts %s into a container that executes "
+            "model-authored commands; the key is readable there",
+            SSH_DIR,
+        )
+        return ["--volume", "{}:/root/.ssh:ro".format(SSH_DIR)]
+
+    if SSH_MODE != "agent":
+        raise ValueError("unknown SANDBOX_SSH_MODE {!r}".format(SSH_MODE))
+
+    arguments = []
+
+    known_hosts = os.path.join(SSH_DIR, "known_hosts")
+    if os.path.isfile(known_hosts):
+        arguments += [
+            "--volume", "{}:/root/.ssh/known_hosts:ro".format(known_hosts),
+        ]
+    else:
+        # Worth saying out loud: the failure is a clone that cannot verify the
+        # host, which reads as a permissions problem rather than a missing file.
+        logger.warning(
+            "no known_hosts at %s; the container cannot verify the git remote. "
+            "Run: ssh-keyscan github.com >> %s",
+            known_hosts,
+            known_hosts,
+        )
+
+    host_sock = _host_ssh_sock()
+    if host_sock is None:
+        # Not fatal here: a clone from a reachable remote may still work, and
+        # failing the spawn would hide the real error behind a spawn refusal.
+        logger.warning(
+            "SANDBOX_SSH_MODE=agent but no ssh-agent socket found; "
+            "the container will have no git credentials"
+        )
+        return arguments
+
+    return arguments + [
+        "--volume", "{}:{}".format(host_sock, CONTAINER_SSH_SOCK),
+        "--env", "SSH_AUTH_SOCK={}".format(CONTAINER_SSH_SOCK),
+    ]
+
+
+def _host_ssh_sock() -> Optional[str]:
+    """The socket to forward, or None if the host has no agent running.
+
+    On Docker Desktop the host's `SSH_AUTH_SOCK` is not reachable from the
+    VM, so the fixed path it publishes is used instead. It only carries keys
+    the user has actually added, so `ssh-add` having been run is part of the
+    contract either way.
+    """
+    if sys.platform == "darwin":
+        return DESKTOP_SSH_SOCK
+
+    sock = os.environ.get("SSH_AUTH_SOCK")
+    if sock and os.path.exists(sock):
+        return sock
+    return None
 
 
 def _start_container(
@@ -135,6 +322,11 @@ def _start_container(
     if os.path.isdir(repo_url):
         # The bare repo stands in for GitHub, so the container needs it mounted.
         command += ["--volume", "{}:{}".format(repo_url, repo_url)]
+    else:
+        # Anything else is a real remote and needs credentials to read it,
+        # and the same credentials again to push every checkpoint.
+        command += _ssh_arguments()
+
     command.append(SANDBOX_IMAGE)
 
     try:

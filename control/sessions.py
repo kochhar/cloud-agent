@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 import uuid
 
@@ -11,6 +12,11 @@ import sandbox
 
 logger = logging.getLogger(__name__)
 
+# Shared by both long-polls: the events feed and the next-action poll. Held
+# under the usual 30s proxy timeout so a poll returns rather than resets.
+LONG_POLL_SECONDS = 25.0
+POLL_INTERVAL_SECONDS = 0.5
+
 
 class SessionNotFound(Exception):
     pass
@@ -18,6 +24,252 @@ class SessionNotFound(Exception):
 
 class StaleEpoch(Exception):
     pass
+
+
+# ---------- ---------- ----------
+# client-facing API
+# ---------- ---------- ----------
+def create_session(repo_url: str, prompt:str) -> dict:
+    branch = f"agent/{uuid.uuid4().hex[:8]}"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sessions (repo_url, branch, status) "
+                "VALUES (%s, %s, 'awaiting_user') RETURNING id, branch",
+                (repo_url, branch),
+            )
+
+            row = cur.fetchone()
+            session_id = row["id"]
+            _append_message(cur, session_id, "system", llm.SYSTEM_PROMPT)
+            _append_message(cur, session_id, "user", prompt)
+            _emit(cur, session_id, "status", {"status": "starting"})
+    
+    # Container boot and the first LLM call happen in parallel.
+    sandbox.spawn(session_id)
+    advance(session_id)
+    return {"session_id": session_id, "branch": branch}
+
+
+def get_events(
+    session_id: str,
+    after: int = 0,
+    limit: int = 500,
+    timeout: float = LONG_POLL_SECONDS,
+) -> list[dict]:
+    """Long-poll the UI feed for events after a sequence number.
+
+    An empty list means the hold expired and the client should poll again with
+    the same cursor.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Check once up front, so polling a bad id fails now rather than
+            # after the full hold.
+            cur.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,))
+            if cur.fetchone() is None:
+                raise SessionNotFound(session_id)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT seq, type, payload, created_at FROM events "
+                    "WHERE session_id = %s AND seq > %s ORDER BY seq LIMIT %s",
+                    (session_id, after, limit),
+                )
+                rows = cur.fetchall()
+        
+        if rows:
+            return rows
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ---------- ---------- ----------
+# the loop
+# ---------- ---------- ----------
+def advance(session_id: str) -> None:
+    """One iteration of the inner loop.
+
+    Does nothing if another instance is already advancing this session, or 
+    if the session is finished.
+    """
+    if not _claim_thinking(session_id):
+        return
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            context = _load_context(cur, session_id)
+
+    # Deliberately outside any transaction: this is a network call that can
+    # take a minute, and nothing should sit locked while it runs.
+    try:
+        reply = llm.complete(context)
+    except Exception as exc:
+        # Recorded on the session rather than raised, so the handler that
+        # triggered this still returns and the client learns about it from
+        # the event feed.
+        logger.exception("model call failed for session %s", session_id)
+        _fail(session_id, f"model call failed: {exc}")
+        return
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            message_id = _append_message(
+                cur,
+                session_id,
+                "assistant",
+                content=reply.text,
+                reasoning=reply.reasoning,
+                tool_calls=reply.raw_tool_calls,
+            )
+
+            if reply.text:
+                _emit(cur, session_id, "text", {"text": reply.text})
+            if reply.reasoning:
+                _emit(cur, session_id, "thinking", {"text": reply.reasoning})
+
+            if not reply.tool_calls:
+                # The doc is inconsistent here: the loop pseudocode says
+                # awaiting_user, the Lifecycle section says complete. Following
+                # the pseudocode so the client can keep the conversation going.
+                _set_status(cur, session_id, "awaiting_user")
+                return
+
+            for call in reply.tool_calls:
+                action_id = _insert_tool_call(cur, session_id, message_id, call)
+                _emit(
+                    cur,
+                    session_id,
+                    "tool_started",
+                    {
+                        "action_id": str(action_id),
+                        "name": call.name,
+                        "args": call.args,
+                    },
+                )
+            _set_status(cur, session_id, "executing")
+
+
+# ---------- ---------- ----------
+# sandbox-facing API
+# ---------- ---------- ----------
+
+# Each sandbox death re-dispatches the same call. Past this many attempts the
+# session fails rather than spawning containers forever.
+MAX_TOOL_ATTEMPTS = 3
+
+# Results reach the model in full and the UI truncated.
+RESULT_PREVIEW_CHARS = 2000
+
+
+class UnknownAction(Exception):
+    pass
+
+
+def claim_next_action(
+    session_id: str, epoch: int, timeout: float = LONG_POLL_SECONDS
+) -> dict | None:
+    """Long-poll for the next tool call. None means the hold expired."""
+    deadline = time.monotonic() + timeout
+    while True:
+        action = _claim_one_action(session_id, epoch)
+        if action is not None:
+            return action
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def record_action_result(
+    session_id: str,
+    action_id: str,
+    epoch: int,
+    result: str | None = None,
+    exit_code: int | None = None,
+    commit_sha: str | None = None,
+) -> bool:
+    """Accept a tool result from the current epoch.
+
+    Returns True when this was the last outstanding call of its batch, which
+    is the caller's cue to advance the loop. A non-zero exit code is still a
+    result: it goes back to the model as content rather than failing the call.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _require_current_epoch(cur, session_id, epoch)
+
+            cur.execute(
+                """
+                UPDATE tool_calls
+                   SET status = 'done',
+                       result = %s,
+                       exit_code = %s,
+                       commit_sha = %s,
+                       completed_at = now()
+                 WHERE id = %s
+                   AND session_id = %s
+                   AND status = 'dispatched'
+                   AND epoch = (SELECT current_epoch FROM sessions WHERE id = %s)
+                RETURNING id, name, message_id, exit_code, commit_sha, repeated
+                """,
+                (result, exit_code, commit_sha, action_id, session_id, session_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise _rejected(cur, session_id, action_id, epoch)
+
+            if commit_sha:
+                # Only a SHA from a live epoch may move the branch head.
+                cur.execute(
+                    "UPDATE sessions SET last_accepted_sha = %s, updated_at = now() "
+                    "WHERE id = %s",
+                    (commit_sha, session_id),
+                )
+
+            _emit(
+                cur,
+                session_id,
+                "tool_finished",
+                {
+                    "action_id": str(row["id"]),
+                    "name": row["name"],
+                    "exit_code": row["exit_code"],
+                    "commit_sha": row["commit_sha"],
+                    "repeated": row["repeated"],
+                    "result": _preview(result),
+                },
+            )
+
+            cur.execute(
+                "SELECT count(*) AS open FROM tool_calls "
+                "WHERE session_id = %s AND message_id = %s "
+                "AND status IN ('pending', 'dispatched')",
+                (session_id, row["message_id"]),
+            )
+            if cur.fetchone()["open"]:
+                return False
+
+            # Whole batch is in. Every result becomes its own tool message so
+            # the context replays against the provider's tool_call ids.
+            cur.execute(
+                "SELECT provider_call_id, result, exit_code, repeated, attempts, status "
+                "FROM tool_calls WHERE session_id = %s AND message_id = %s "
+                "ORDER BY created_at",
+                (session_id, row["message_id"]),
+            )
+            for call in cur.fetchall():
+                _append_message(
+                    cur,
+                    session_id,
+                    "tool",
+                    content=_tool_message(call),
+                    provider_call_id=call["provider_call_id"],
+                )
+            return True
 
 
 def _next_seq(cur, session_id: str, column: str) -> int:
@@ -158,93 +410,102 @@ def _fail(session_id: str, error: str) -> None:
             _set_status(cur, session_id, "failed", error)
 
 
-# ---------- ---------- ----------
-# client-facing API
-# ---------- ---------- ----------
-def create_session(repo_url: str, prompt:str) -> dict:
-    branch = f"agent/{uuid.uuid4().hex[:8]}"
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO sessions (repo_url, branch, status) "
-                "VALUES (%s, %s, 'awaiting_user') RETURNING id, branch",
-                (repo_url, branch),
-            )
-
-            row = cur.fetchone()
-            session_id = row["id"]
-            _append_message(cur, session_id, "system", llm.SYSTEM_PROMPT)
-            _append_message(cur, session_id, "user", prompt)
-            _emit(cur, session_id, "status", {"status": "starting"})
-    
-    # Container boot and the first LLM call happen in parallel.
-    sandbox.spawn(session_id)
-    advance(session_id)
-    return {"session_id": session_id, "branch": branch}
+def _require_current_epoch(cur, session_id: str, epoch: int) -> int:
+    """Reject a caller from a sandbox that has already been replaced."""
+    current = _current_epoch(cur, session_id)
+    if epoch < current:
+        raise StaleEpoch(
+            f"epoch {epoch} is stale, session {session_id} is at epoch {current}"
+        )
+    return current
 
 
-# ---------- ---------- ----------
-# the loop
-# ---------- ---------- ----------
-def advance(session_id: str) -> None:
-    """One iteration of the inner loop.
+def _claim_one_action(session_id: str, epoch: int) -> dict | None:
+    """Hand the oldest pending call to exactly one caller.
 
-    Runs when a request arrives that gives it something to do: a user message,
-    or the last outstanding tool result. Does nothing if another instance is
-    already advancing this session, or if the session is finished.
+    SKIP LOCKED means two sandboxes polling at the same moment take different
+    rows instead of blocking on each other.
     """
-    if not _claim_thinking(session_id):
-        return
-
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            context = _load_context(cur, session_id)
-
-    # Deliberately outside any transaction: this is a network call that can
-    # take a minute, and nothing should sit locked while it runs.
-    try:
-        reply = llm.complete(context)
-    except Exception as exc:
-        # Recorded on the session rather than raised, so the handler that
-        # triggered this still returns and the client learns about it from
-        # the event feed.
-        logger.exception("model call failed for session %s", session_id)
-        _fail(session_id, f"model call failed: {exc}")
-        return
-
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            message_id = _append_message(
-                cur,
-                session_id,
-                "assistant",
-                content=reply.text,
-                reasoning=reply.reasoning,
-                tool_calls=reply.raw_tool_calls,
+            _require_current_epoch(cur, session_id, epoch)
+            cur.execute(
+                """
+                UPDATE tool_calls
+                   SET status = 'dispatched',
+                       epoch = %s,
+                       attempts = attempts + 1,
+                       repeated = (attempts > 0),
+                       dispatched_at = now()
+                 WHERE id = (
+                       SELECT id FROM tool_calls
+                        WHERE session_id = %s
+                          AND status = 'pending'
+                        ORDER BY created_at
+                        LIMIT 1
+                          FOR UPDATE SKIP LOCKED)
+                RETURNING id, name, args, attempts, repeated
+                """,
+                (epoch, session_id),
             )
+            row = cur.fetchone()
+            if row is None:
+                return None
 
-            if reply.text:
-                _emit(cur, session_id, "text", {"text": reply.text})
-            if reply.reasoning:
-                _emit(cur, session_id, "thinking", {"text": reply.reasoning})
-
-            if not reply.tool_calls:
-                # The doc is inconsistent here: the loop pseudocode says
-                # awaiting_user, the Lifecycle section says complete. Following
-                # the pseudocode so the client can keep the conversation going.
-                _set_status(cur, session_id, "awaiting_user")
-                return
-
-            for call in reply.tool_calls:
-                action_id = _insert_tool_call(cur, session_id, message_id, call)
-                _emit(
+            if row["attempts"] > MAX_TOOL_ATTEMPTS:
+                cur.execute(
+                    "UPDATE tool_calls SET status = 'failed', completed_at = now() "
+                    "WHERE id = %s",
+                    (row["id"],),
+                )
+                _set_status(
                     cur,
                     session_id,
-                    "tool_started",
-                    {
-                        "action_id": str(action_id),
-                        "name": call.name,
-                        "args": call.args,
-                    },
+                    "failed",
+                    f"tool call {row['name']} failed after {row['attempts'] - 1} attempts",
                 )
-            _set_status(cur, session_id, "executing")
+                return None
+
+            return row
+
+
+def _rejected(cur, session_id: str, action_id: str, epoch: int) -> Exception:
+    """Turn a no-op UPDATE into the reason it did not apply."""
+    cur.execute(
+        "SELECT status, epoch FROM tool_calls WHERE id = %s AND session_id = %s",
+        (action_id, session_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return UnknownAction(f"no tool call {action_id} on session {session_id}")
+    if row["epoch"] is not None and row["epoch"] != epoch:
+        return StaleEpoch(
+            f"tool call {action_id} went to epoch {row['epoch']}, not {epoch}"
+        )
+    return UnknownAction(
+        f"tool call {action_id} is {row['status']}, expected dispatched"
+    )
+
+
+def _tool_message(call: dict) -> str:
+    """What the model sees for one completed tool call."""
+    if call["status"] == "failed":
+        return f"tool call did not complete after {call['attempts']} attempts"
+
+    body = call["result"] or ""
+    if call["repeated"]:
+        # At-least-once execution: the model should know this may have run twice.
+        body = (
+            "[this call was re-dispatched after a sandbox died and may have "
+            "executed more than once]\n" + body
+        )
+    if call["exit_code"]:
+        body = f"{body}\n[exit code {call['exit_code']}]"
+    return body
+
+
+def _preview(text: str | None) -> str | None:
+    if text is None or len(text) <= RESULT_PREVIEW_CHARS:
+        return text
+    dropped = len(text) - RESULT_PREVIEW_CHARS
+    return text[:RESULT_PREVIEW_CHARS] + f"\n… truncated, {dropped} more characters"
