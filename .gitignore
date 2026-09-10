@@ -28,3 +28,7 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Scratch
+.scratch/
+
