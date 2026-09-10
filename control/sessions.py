@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-import uuid
+import logging
 from typing import Any
+import uuid
 
-from psycopg.rows import dict_row
-
-import sandbox
 from db import pool
+import llm
+import sandbox
+
+logger = logging.getLogger(__name__)
 
 
 class SessionNotFound(Exception):
@@ -97,14 +99,72 @@ def _current_epoch(cur, session_id: str) -> int:
     return row["current_epoch"]
 
 
+def _set_status(cur, session_id: str, status: str, error: str | None = None) -> None:
+    cur.execute(
+        "UPDATE sessions SET status = %s, error = %s, "
+        "thinking_since = CASE WHEN %s = 'thinking' THEN now() ELSE NULL END, "
+        "updated_at = now() WHERE id = %s",
+        (status, error, status, session_id),
+    )
+    payload = {"status": status}
+    if error:
+        payload["error"] = error
+    _emit(cur, session_id, "status", payload)
+
+
+def _insert_tool_call(cur, session_id: str, message_id: str, call) -> str:
+    cur.execute(
+        """
+        INSERT INTO tool_calls (session_id, message_id, provider_call_id, name, args)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            session_id,
+            message_id,
+            call.provider_call_id,
+            call.name,
+            json.dumps(call.args),
+        ),
+    )
+    return cur.fetchone()["id"]
+
+
+def _claim_thinking(session_id: str) -> bool:
+    """Win the right to call the model.
+
+    Its own short transaction, so the row is not held locked across a network
+    call. Losing the race is normal: it means another instance is already
+    advancing this session, or the session is finished.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET status = 'thinking', thinking_since = now(), "
+                "updated_at = now() "
+                "WHERE id = %s AND status IN ('awaiting_user', 'executing') "
+                "RETURNING id",
+                (session_id,),
+            )
+            if cur.fetchone() is None:
+                return False
+            _emit(cur, session_id, "status", {"status": "thinking"})
+            return True
+
+
+def _fail(session_id: str, error: str) -> None:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            _set_status(cur, session_id, "failed", error)
+
+
 # ---------- ---------- ----------
 # client-facing API
 # ---------- ---------- ----------
 def create_session(repo_url: str, prompt:str) -> dict:
     branch = f"agent/{uuid.uuid4().hex[:8]}"
     with pool.connection() as conn:
-        conn.row_factory = dict_row
-        with conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO sessions (repo_url, branch, status) "
                 "VALUES (%s, %s, 'awaiting_user') RETURNING id, branch",
@@ -122,3 +182,69 @@ def create_session(repo_url: str, prompt:str) -> dict:
     advance(session_id)
     return {"session_id": session_id, "branch": branch}
 
+
+# ---------- ---------- ----------
+# the loop
+# ---------- ---------- ----------
+def advance(session_id: str) -> None:
+    """One iteration of the inner loop.
+
+    Runs when a request arrives that gives it something to do: a user message,
+    or the last outstanding tool result. Does nothing if another instance is
+    already advancing this session, or if the session is finished.
+    """
+    if not _claim_thinking(session_id):
+        return
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            context = _load_context(cur, session_id)
+
+    # Deliberately outside any transaction: this is a network call that can
+    # take a minute, and nothing should sit locked while it runs.
+    try:
+        reply = llm.complete(context)
+    except Exception as exc:
+        # Recorded on the session rather than raised, so the handler that
+        # triggered this still returns and the client learns about it from
+        # the event feed.
+        logger.exception("model call failed for session %s", session_id)
+        _fail(session_id, f"model call failed: {exc}")
+        return
+
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            message_id = _append_message(
+                cur,
+                session_id,
+                "assistant",
+                content=reply.text,
+                reasoning=reply.reasoning,
+                tool_calls=reply.raw_tool_calls,
+            )
+
+            if reply.text:
+                _emit(cur, session_id, "text", {"text": reply.text})
+            if reply.reasoning:
+                _emit(cur, session_id, "thinking", {"text": reply.reasoning})
+
+            if not reply.tool_calls:
+                # The doc is inconsistent here: the loop pseudocode says
+                # awaiting_user, the Lifecycle section says complete. Following
+                # the pseudocode so the client can keep the conversation going.
+                _set_status(cur, session_id, "awaiting_user")
+                return
+
+            for call in reply.tool_calls:
+                action_id = _insert_tool_call(cur, session_id, message_id, call)
+                _emit(
+                    cur,
+                    session_id,
+                    "tool_started",
+                    {
+                        "action_id": str(action_id),
+                        "name": call.name,
+                        "args": call.args,
+                    },
+                )
+            _set_status(cur, session_id, "executing")
