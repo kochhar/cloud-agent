@@ -11,15 +11,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
-SYSTEM_PROMPT = """You are a coding agent working inside a sandboxed clone of a git repository.
+import tools
 
-Use the provided tools to inspect and modify the repository. Constraints:
+_BASE_PROMPT = """You are a coding agent working inside a sandboxed clone of a git repository.
+
+Use the tools below to inspect and modify the repository. Constraints:
 - Every run_command call starts a fresh shell at the repository root. A cd or
   an exported variable does not carry over to the next call.
 - You have no git tools. Commits and branches are handled for you.
 - Write files with their full contents, never a partial patch.
 
-When the task is done, reply with a summary and no tool calls."""
+When the task is done, reply with a summary and no tool calls.
+"""
+
+# Rendered from tools.TOOL_SCHEMAS rather than written out again, so the prompt
+# cannot drift from the schemas the provider is sent.
+SYSTEM_PROMPT = _BASE_PROMPT.rstrip() + "\n\n" + tools.render()
 
 
 class NotConfigured(RuntimeError):
