@@ -16,6 +16,7 @@ Control plane for a local version of a cloud coding agent. Design lives in
 | `control/config.py` | Timeouts and ceilings, overridable from the environment. |
 | `db/` | Pool, transaction helpers, and the executable schema. |
 | `agent/` | The container image and `cursord`, the daemon inside it. |
+| `client/` | The browser client. Enqueues tasks and renders the event feed. |
 
 `db/schema.sql` is what actually runs and is applied on startup.
 `docs/schema.sql` is the design document, and additionally carries the three
@@ -54,11 +55,37 @@ uvicorn app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 Tables are created on startup if missing. `GET /healthz` checks the database,
-and the routes are browsable at http://127.0.0.1:8000/docs.
+the client is at http://127.0.0.1:8000/ui/, and the routes are browsable at
+http://127.0.0.1:8000/docs.
 
 To reach a real model, set `XAI_API_KEY` (optionally `LLM_MODEL`,
 `LLM_BASE_URL`). Without it the first `advance` records a failure on the
 session rather than raising, so the client sees it in the event feed.
+
+## Client
+
+The client is a page at http://127.0.0.1:8000/ui/. Three static files, no
+build step and no dependencies: set the git workspace, enqueue a task, watch
+the event feed. It holds no logic beyond rendering, as the architecture doc
+asks of it.
+
+`app.py` serves `client/` itself so the page is same-origin with the API it
+calls. A client on its own origin would mean CORS configured on the control
+plane and a preflight on every request, to reach a service the browser is
+already talking to.
+
+The git workspace URL is set once and kept in `localStorage`, because
+`POST /sessions` wants a `repo_url` on every call. It is read on the control
+plane's filesystem rather than the browser's, so a local bare repo has to be
+given as an absolute path. The session list is browser-side too: there is no
+route that lists sessions.
+
+Reloading the page replays the feed of the most recent session from seq 0, so
+a closed tab loses nothing. The feed stops on a terminal status.
+
+Send, Diff and Cancel are wired to the routes in the doc and currently report
+that the control plane has not built them, which is true: they are 501 in
+`app.py`.
 
 ## Checks
 
@@ -69,6 +96,15 @@ session rather than raising, so the client sees it in the event feed.
 Drives the full loop against a scratch database with a scripted model: create,
 register, dispatch, result, recovery from a dead sandbox, cancel.
 
+```bash
+.venv/bin/python scripts/check_tools.py
+```
+
+Compares the schemas in `control/tools.py` against the handlers in
+`agent/cursord/tools.py`. The two halves ship in different images and cannot
+import each other, so a renamed argument would otherwise stay invisible until
+a live session called that tool and failed on every retry.
+
 ## The sandbox
 
 `agent/` holds the container image and `cursord`. Outline and the open
@@ -78,6 +114,17 @@ contract questions it raised are in
 ```bash
 docker build -t cloud-agent-sandbox:dev agent/
 export SANDBOX_IMAGE=cloud-agent-sandbox:dev
+```
+
+Against a real git remote the container needs credentials. It runs
+model-authored commands, so by default the host's ssh-agent socket is
+forwarded rather than the key being mounted, which keeps the key out of a
+filesystem the agent can read. `SANDBOX_SSH_MODE` is `agent`, `keys`, or
+`none`; the trade-offs are in the doc above.
+
+```bash
+ssh-keyscan github.com >> ~/.ssh/known_hosts   # once
+ssh-add ~/.ssh/id_ed25519                      # per login
 ```
 
 ## Not built yet
