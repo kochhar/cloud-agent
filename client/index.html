@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloud agent</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <h1>cloud agent</h1>
+  <span id="health" class="pill" title="control plane">checking…</span>
+</header>
+
+<main>
+  <!-- Left column: the two things the client is for, setting the workspace
+       and enqueueing a task, plus a way back into an earlier session. -->
+  <aside>
+    <section>
+      <h2>Git workspace</h2>
+      <form id="workspace-form">
+        <input id="repo-url" type="text" spellcheck="false"
+               placeholder="/srv/repos/demo.git" autocomplete="off">
+        <button type="submit">Save</button>
+      </form>
+      <p class="hint">
+        The bare repo every task is cloned from. Sent as <code>repo_url</code>
+        on each new session and remembered in this browser. A path is read on
+        the control plane's filesystem, not this one, so it has to be absolute.
+      </p>
+      <p id="repo-note" class="note" hidden></p>
+    </section>
+
+    <section>
+      <h2>New task</h2>
+      <form id="task-form">
+        <textarea id="prompt" rows="5" placeholder="Describe the task…"></textarea>
+        <button type="submit" id="enqueue">Enqueue task</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Sessions</h2>
+      <ul id="sessions" class="sessions"></ul>
+      <p class="hint">Kept in this browser only; the control plane has no list route.</p>
+    </section>
+  </aside>
+
+  <!-- Right column: the event feed, which is the whole of the UI's job. -->
+  <section class="feed-pane">
+    <div class="feed-head">
+      <div>
+        <span id="session-id" class="mono">no session</span>
+        <span id="branch" class="mono dim"></span>
+      </div>
+      <div class="feed-actions">
+        <span id="status" class="pill">idle</span>
+        <button id="diff-btn" class="ghost" disabled>Diff</button>
+        <button id="cancel-btn" class="ghost" disabled>Cancel</button>
+      </div>
+    </div>
+
+    <ol id="feed" class="feed" aria-live="polite"></ol>
+
+    <form id="message-form" class="message-form">
+      <input id="message" type="text" placeholder="Reply to the agent…" disabled autocomplete="off">
+      <button type="submit" disabled>Send</button>
+    </form>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
