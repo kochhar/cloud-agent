@@ -85,12 +85,16 @@ finish. The failure would get worse the more useful the tool call was.
 
 ## Tool surface
 
-| Tool | Shape | Limit |
+Names and argument spellings come from `control/tools.py`, which is what the
+model is told. cursord only executes; `scripts/check_tools.py` is what keeps
+the two in agreement, since they cannot import each other.
+
+| Tool | Arguments | Limit |
 | :- | :- | :- |
-| `read_file` | `path` | 256 KiB, truncated |
-| `write_file` | `path`, `content` | full contents only, so a re-run is a no-op |
+| `read_file` | `path` | 256 KiB, truncation stated in the output |
+| `write_file` | `path`, `contents` | full contents only, so a re-run is a no-op |
 | `list_files` | `path`, `recursive` | 1000 entries |
-| `run_command` | `command`, `timeout` | 120s default, own process group, 64 KiB of merged output |
+| `run_command` | `command`, `timeout_seconds` | 120s default, own process group, 64 KiB of merged output |
 
 `run_command` starts a new session per call and is killed by process group on
 timeout, so a backgrounded child cannot hold the pipe open or outlive the call.
@@ -102,6 +106,46 @@ makes recovery a rebuild rather than a replay.
 No tool raises. A tool that fails returns its failure as output with a nonzero
 exit code, because a sandbox that died to report a bad path would cost a whole
 epoch to say so.
+
+## Git credentials
+
+Against the local bare repo the container needs nothing: the repo is a path,
+mounted straight in. Against a real remote it needs a key for the clone and
+the same key again for every checkpoint push, and how that key gets in is a
+security decision rather than a plumbing one.
+
+The container executes model-authored shell commands. Anything readable in its
+filesystem is readable by the agent, so a bind-mounted private key is a key the
+agent can print into a tool result — where it would then be written to the
+`tool_calls` table and replayed into the model's context on every subsequent
+turn. `SANDBOX_SSH_MODE` picks between:
+
+| Mode | What the container gets | Cost |
+| :- | :- | :- |
+| `agent` (default) | the host ssh-agent socket, forwarded | key never enters the container; the agent can still *use* it while running |
+| `keys` | `~/.ssh` bind-mounted read-only | private key readable by any model-authored command |
+| `none` | nothing | correct for the local bare repo |
+
+Agent forwarding is the default because it removes the exfiltration path
+without removing the capability. It does not remove the capability itself:
+while the container lives, anything running in it can push wherever that key
+can push. A deploy key scoped to one repository is the way to bound that, and
+is worth doing before pointing this at anything that matters.
+
+Either way `ssh-add` has to have been run on the host — the socket only offers
+keys the agent is actually holding.
+
+`known_hosts` is mounted in both credentialed modes. The image sets
+`StrictHostKeyChecking=yes`, so without it the clone refuses the connection;
+the alternative of disabling the check would have the container accept any host
+key for the remote it pushes to. `BatchMode=yes` is set for a duller reason: an
+unattended container that hits an interactive prompt hangs until the spawn
+timeout instead of failing with a reason.
+
+```bash
+ssh-keyscan github.com >> ~/.ssh/known_hosts   # once
+ssh-add ~/.ssh/id_ed25519                      # per login
+```
 
 ## Running it
 
@@ -120,6 +164,19 @@ docker run --rm \
   -e CONTROL_URL=http://host.docker.internal:8000 \
   -e REPO_URL=/srv/repos/demo.git -e BRANCH=agent/abc12345 \
   -v /srv/repos/demo.git:/srv/repos/demo.git \
+  cloud-agent-sandbox:dev
+```
+
+Against a real remote, with the host's agent forwarded (the socket path is
+Docker Desktop's; on Linux bind `$SSH_AUTH_SOCK` instead):
+
+```bash
+docker run --rm \
+  -e SESSION_ID=... -e EPOCH=1 \
+  -e CONTROL_URL=http://host.docker.internal:8000 \
+  -e REPO_URL=git@github.com:acme/widgets.git -e BRANCH=agent/abc12345 \
+  -v ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro \
+  -v /run/host-services/ssh-auth.sock:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent \
   cloud-agent-sandbox:dev
 ```
 
@@ -169,3 +226,15 @@ on the control-plane side before the container is finished.
 8. **Teardown needs a handle on the container.** `app.py` calls
    `sandbox.teardown`, which does not exist yet. A `--name` or a label per
    session and epoch makes it a one-liner and also makes an orphan easy to find.
+
+9. **A container that dies before claiming a tool call respawns forever.**
+   The architecture doc bounds repeated crashes with the per-tool-call attempt
+   counter, but that only counts once a call has been *dispatched*. A sandbox
+   that fails during clone never claims one, so attempts stays at zero: it
+   dies, misses heartbeats, gets reaped, and is replaced by a container that
+   fails the same way. This was hard to hit while the repo was a mounted path
+   and a clone could barely fail. With a real remote, a missing key, an
+   unknown host, or a revoked deploy key all land exactly here. The session
+   needs a spawn ceiling of its own, independent of tool attempts, and there
+   is currently no way for cursord to report "I could not start" — it has no
+   endpoint for a failure that happens before the first result.
