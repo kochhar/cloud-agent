@@ -1,10 +1,9 @@
 """Sandbox lifecycle.
 
-A container can vanish at any moment. What protects the session is the epoch:
-it is bumped every time a sandbox is spawned, and cursord carries the epoch it
-was born with on every request. A container that comes back from the dead has
-an epoch behind the session's, so nothing it reports is accepted and it is
-never handed more work.
+A container can vanish at any moment. The session is protected by the epoch:
+it is bumped every time a sandbox is spawned, and cursord carries the epoch when it
+was born. A container that comes back from the dead has an epoch behind the session's, 
+so nothing it reports is accepted and it is never handed more work.
 """
 
 from __future__ import annotations
@@ -14,8 +13,6 @@ import os
 import shutil
 import subprocess
 from typing import Any, Optional
-
-from psycopg.rows import dict_row
 
 import sessions
 from db import pool
@@ -44,7 +41,7 @@ def spawn(session_id: str) -> dict:
     leaves a recoverable sandbox row rather than an orphaned container.
     """
     with pool.connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
+        with conn.cursor() as cur:
             # The UPDATE takes the row lock, so two instances spawning at once
             # get different epochs rather than the same one.
             cur.execute(
@@ -53,6 +50,7 @@ def spawn(session_id: str) -> dict:
                 "RETURNING current_epoch, repo_url, branch",
                 (session_id,),
             )
+            
             row = cur.fetchone()
             if row is None:
                 raise _refusal(cur, session_id)
@@ -112,9 +110,6 @@ def _start_container(
 
     Returning None is not fatal: the sandbox row exists at this epoch, so a
     cursord process started by hand can register against it.
-
-    This is the local-host implementation, and the one that becomes an
-    interface per the TODO in spawn().
     """
     if not SANDBOX_IMAGE:
         logger.warning(
