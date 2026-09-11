@@ -14,11 +14,13 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import db
@@ -227,3 +229,29 @@ def save_action_result(
 @app.post("/sandbox/{session_id}/heartbeat")
 def heartbeat(session_id: str, body: HeartbeatRequest) -> Dict[str, Any]:
     raise _not_built("sandbox.heartbeat")
+
+
+# ---------------------------------------------------------------------------
+# the browser client
+#
+# Served from the control plane rather than a static server of its own, so the
+# page is same-origin with the API it calls. That is the whole reason: a client
+# on another origin would need CORS configured here and a preflight on every
+# request, to reach a service the browser is already talking to.
+#
+# Mounted last. A mount matches by prefix and would shadow any route declared
+# after it.
+# ---------------------------------------------------------------------------
+CLIENT_DIR = Path(__file__).resolve().parent.parent / "client"
+
+if CLIENT_DIR.is_dir():
+
+    @app.get("/", include_in_schema=False)
+    def index() -> RedirectResponse:
+        return RedirectResponse("/ui/")
+
+    app.mount("/ui", StaticFiles(directory=CLIENT_DIR, html=True), name="ui")
+else:
+    logging.getLogger(__name__).warning(
+        "no client/ directory at %s; the UI is not served", CLIENT_DIR
+    )
