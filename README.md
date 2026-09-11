@@ -86,10 +86,10 @@ plane and a preflight on every request, to reach a service the browser is
 already talking to.
 
 The git workspace URL is set once and kept in `localStorage`, because
-`POST /sessions` wants a `repo_url` on every call. It is read on the control
-plane's filesystem rather than the browser's, so a local bare repo has to be
-given as an absolute path. The session list is browser-side too: there is no
-route that lists sessions.
+`POST /sessions` wants a `repo_url` on every call. The sandbox clones it over
+ssh, so it has to be a remote the host's key can reach rather than a path on
+either machine. The session list is browser-side too: there is no route that
+lists sessions.
 
 Reloading the page replays the feed of the most recent session from seq 0, so
 a closed tab loses nothing. The feed stops on a terminal status.
@@ -127,11 +127,11 @@ docker build -t cloud-agent-sandbox:dev agent/
 export SANDBOX_IMAGE=cloud-agent-sandbox:dev
 ```
 
-Against a real git remote the container needs credentials. It runs
+Every repo is a real git remote, so the container needs credentials. It runs
 model-authored commands, so by default the host's ssh-agent socket is
 forwarded rather than the key being mounted, which keeps the key out of a
-filesystem the agent can read. `SANDBOX_SSH_MODE` is `agent`, `keys`, or
-`none`; the trade-offs are in the doc above.
+filesystem the agent can read. `SANDBOX_SSH_MODE` is `agent` or `keys`; the
+trade-offs are in the doc above.
 
 ```bash
 ssh-keyscan github.com >> ~/.ssh/known_hosts   # once
@@ -140,8 +140,9 @@ ssh-add ~/.ssh/id_ed25519                      # per login
 
 ## Not built yet
 
-- `cursord` is a sketch: it has not been run against a live control plane, and
-  the clone/checkpoint path has not been exercised against a real bare repo.
+- The clone/checkpoint path has not been exercised against a real remote. It
+  has only been run against a bare repo on this filesystem, which is no longer
+  a supported `repo_url`.
 - Container spawning. `control/sandbox.py` records the sandbox row and opens
   the epoch, but the default spawner starts nothing; install one with
   `sandbox.use_spawner()`.

@@ -21,13 +21,13 @@
       <h2>Git workspace</h2>
       <form id="workspace-form">
         <input id="repo-url" type="text" spellcheck="false"
-               placeholder="/srv/repos/demo.git" autocomplete="off">
+               placeholder="git@github.com:you/repo.git" autocomplete="off">
         <button type="submit">Save</button>
       </form>
       <p class="hint">
-        The bare repo every task is cloned from. Sent as <code>repo_url</code>
-        on each new session and remembered in this browser. A path is read on
-        the control plane's filesystem, not this one, so it has to be absolute.
+        The git remote every task is cloned from. Sent as <code>repo_url</code>
+        on each new session and remembered in this browser. The sandbox clones
+        it over ssh, so it has to be a remote the host's key can reach.
       </p>
       <p id="repo-note" class="note" hidden></p>
     </section>

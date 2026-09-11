@@ -172,6 +172,17 @@ function render(event) {
       break;
     }
 
+    case "tool_requeued":
+      // A call that was in flight when its sandbox died, handed back to the
+      // queue. The next tool_started for it carries the same action_id.
+      row(
+        "tool",
+        `${payload.name} requeued after epoch ${payload.lost_epoch} died` +
+          ` (attempt ${payload.attempts})`,
+        "bad",
+      );
+      break;
+
     default: {
       // The sandbox lifecycle set, which only ever reaches the client. The
       // state goes in the body rather than the tag, which is too narrow for

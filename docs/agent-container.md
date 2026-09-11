@@ -22,7 +22,7 @@ decision.
   │   work task                                 ▼                    │
   │     ├── GET  /next-action  (long poll) ─── control plane         │
   │     ├── execute tool ── /workspace/repo                          │
-  │     ├── commit + push ─────────────────────────▶ bare git repo   │
+  │     ├── commit + push ─────────────────────────▶ git remote      │
   │     └── POST /actions/{id}/result ───────── control plane        │
   │                                                                  │
   └──────────────────────────────────────────────────────────────────┘
@@ -57,7 +57,7 @@ holding, because nothing it produces will be accepted.
 ## The two rules that make recovery work
 
 **Push before report.** A result is only reported once the file state that
-produced it is durable in the bare repo. The control plane can therefore treat
+produced it is durable on the remote. The control plane can therefore treat
 an accepted result and its commit SHA as a single fact.
 
 The cost is a window: a container that pushes and then dies before reporting
@@ -109,9 +109,8 @@ epoch to say so.
 
 ## Git credentials
 
-Against the local bare repo the container needs nothing: the repo is a path,
-mounted straight in. Against a real remote it needs a key for the clone and
-the same key again for every checkpoint push, and how that key gets in is a
+Every repo is a real remote. The container needs a key for the clone and the
+same key again for every checkpoint push, and how that key gets in is a
 security decision rather than a plumbing one.
 
 The container executes model-authored shell commands. Anything readable in its
@@ -124,7 +123,6 @@ turn. `SANDBOX_SSH_MODE` picks between:
 | :- | :- | :- |
 | `agent` (default) | the host ssh-agent socket, forwarded | key never enters the container; the agent can still *use* it while running |
 | `keys` | `~/.ssh` bind-mounted read-only | private key readable by any model-authored command |
-| `none` | nothing | correct for the local bare repo |
 
 Agent forwarding is the default because it removes the exfiltration path
 without removing the capability. It does not remove the capability itself:
@@ -156,19 +154,10 @@ export SANDBOX_IMAGE=cloud-agent-sandbox:dev
 
 The container can also be run by hand against a live epoch, which is the
 fastest way to work on it — `control/sandbox.py` already records the sandbox
-row and opens the epoch even when it starts nothing:
+row and opens the epoch even when it starts nothing.
 
-```bash
-docker run --rm \
-  -e SESSION_ID=... -e EPOCH=1 \
-  -e CONTROL_URL=http://host.docker.internal:8000 \
-  -e REPO_URL=/srv/repos/demo.git -e BRANCH=agent/abc12345 \
-  -v /srv/repos/demo.git:/srv/repos/demo.git \
-  cloud-agent-sandbox:dev
-```
-
-Against a real remote, with the host's agent forwarded (the socket path is
-Docker Desktop's; on Linux bind `$SSH_AUTH_SOCK` instead):
+The host's agent is forwarded for the clone and the pushes. The socket path
+below is Docker Desktop's; on Linux bind `$SSH_AUTH_SOCK` instead.
 
 ```bash
 docker run --rm \
@@ -203,7 +192,7 @@ on the control-plane side before the container is finished.
 2. **Who resolves `base_sha`?** The schema comments say "set at first
    register", but register is documented as *returning* the base SHA, and on a
    first spawn the container is the only party holding a clone. Cleaner for the
-   spawner to resolve it with `git ls-remote` against the bare repo before the
+   spawner to resolve it with `git ls-remote` against the remote before the
    container exists, so it is known even if no sandbox ever starts.
 
 3. **`resume_sha` is not in the documented register response.** The doc lists
@@ -215,7 +204,7 @@ on the control-plane side before the container is finished.
    reading the branch would occasionally show work the transcript never
    mentions.
 
-5. **Force-push has to be allowed on the bare repo**, since reconciliation is a
+5. **Force-push has to be allowed on the remote**, since reconciliation is a
    rewind. Worth asserting at setup rather than discovering during a recovery.
 
 6. **Network egress is unresolved.** The sandbox must reach the control plane,
@@ -236,8 +225,8 @@ on the control-plane side before the container is finished.
    counter, but that only counts once a call has been *dispatched*. A sandbox
    that fails during clone never claims one, so attempts stays at zero: it
    dies, misses heartbeats, gets reaped, and is replaced by a container that
-   fails the same way. This was hard to hit while the repo was a mounted path
-   and a clone could barely fail. With a real remote, a missing key, an
+   fails the same way. A mounted path could barely fail a clone and this was
+   hard to hit; now that every repo is a real remote, a missing key, an
    unknown host, or a revoked deploy key all land exactly here. The session
    needs a spawn ceiling of its own, independent of tool attempts, and there
    is currently no way for cursord to report "I could not start" — it has no

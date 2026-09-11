@@ -27,8 +27,8 @@ Key non-functional requirements
                           ▲            │ docker run
                           │ long-poll  ▼
                        ┌───────────────────┐        ┌────────────┐
-                       │ sandbox container │ ─────▶ │  bare git  │
-                       │     (cursord)     │  push  │    repo    │
+                       │ sandbox container │ ─────▶ │ git remote │
+                       │     (cursord)     │  push  │  (origin)  │
                        └───────────────────┘        └────────────┘
 ```
 
@@ -50,7 +50,7 @@ A container can disappear at any time, so the design needs to address what survi
     1. Every user message, model response, tool call, and tool result is a row, written before the next step is taken.
 2. File state goes to git.
     1. After a tool call, cursord runs `git status --porcelain`.
-    2. If the tree is dirty it commits and pushes to the bare repo, and the resulting SHA is returned to control against that tool call.
+    2. If the tree is dirty it commits and pushes to the remote, and the resulting SHA is returned to control against that tool call.
     3. Read-only calls produce no commits, which is most of them.
 3. Everything else in the container is treated as rebuildable:
     1. installed packages, build output, background processes, shell environment.
@@ -175,7 +175,7 @@ Text and thinking are written as whole events when the LLM call returns.
 
 **Run.** Tools available to the model: read file, write file, list files, run command. The write path ends in a commit and a push when the tree is dirty.
 
-**Finish.** The model returns a response with no tool calls. The session is marked `idle` and the diff is read from the bare repo.
+**Finish.** The model returns a response with no tool calls. The session is marked `idle` and the diff is read from the remote.
 
 `idle` is a resting state, not a closed one. The turn is over and the next move belongs to the user, which is a wait with no upper bound, so the sandbox does not sit through it: cursord sees `idle` on its poll, waits out a threshold of its own — five minutes in this build — and exits, reporting that it is going so the control plane can retire the row rather than wait for the heartbeat to go stale.
 
