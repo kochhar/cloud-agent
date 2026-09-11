@@ -55,8 +55,10 @@ Configuration:
 | `DASHBOARD_DB_POOL_MAX` | `4` | Maximum dashboard connections |
 | `DASHBOARD_STATEMENT_TIMEOUT_MS` | `3000` | Per-query ceiling |
 | `DASHBOARD_CACHE_SECONDS` | `10` | Snapshot cache lifetime |
-| `GROK_INPUT_COST_PER_MILLION` | unset | USD per million input tokens |
-| `GROK_OUTPUT_COST_PER_MILLION` | unset | USD per million output tokens |
+| `GROK_INPUT_COST_PER_MILLION` | `2` | USD per million input tokens |
+| `GROK_OUTPUT_COST_PER_MILLION` | `6` | USD per million output tokens |
+| `GROK_LONG_CONTEXT_TOKENS` | `200000` | Prompt size where grok-4.6 doubles rates |
+| `GROK_LONG_CONTEXT_MULTIPLIER` | `2` | Multiplier applied to the whole request |
 
 The pool also sets `default_transaction_read_only=on`. Production should use a
 database role that cannot write even if the application is misconfigured:
@@ -95,8 +97,9 @@ All values use the selected dashboard window unless noted otherwise.
    causes, and stale in-flight attempts from `llm_attempts`.
 7. **Cost per completed turn.** Estimated model cost in the selected window
    divided by completed turn outcomes in that window. This is an operational
-   ratio, not per-turn attribution. It is unavailable unless both token prices
-   are configured and every successful attempt in the window is priced.
+   ratio, not per-turn attribution. Tokens are priced at query time using the
+   grok-4.6 card ($2 / $6 per million, doubled at 200k prompt tokens), so
+   attempts recorded before prices were configured still appear.
 8. **Re-execution.** Calls with `attempts > 1` divided by calls with at least
    one dispatch.
 

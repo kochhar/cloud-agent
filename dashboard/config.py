@@ -39,3 +39,10 @@ POOL_MIN_SIZE = int(os.environ.get("DASHBOARD_DB_POOL_MIN", "1"))
 POOL_MAX_SIZE = int(os.environ.get("DASHBOARD_DB_POOL_MAX", "4"))
 STATEMENT_TIMEOUT_MS = int(os.environ.get("DASHBOARD_STATEMENT_TIMEOUT_MS", "3000"))
 CACHE_SECONDS = float(os.environ.get("DASHBOARD_CACHE_SECONDS", "10"))
+
+# Same grok-4.6 defaults as control. The dashboard prices stored tokens at
+# query time so attempts recorded before prices were configured still cost.
+INPUT_COST_PER_MILLION = float(os.environ.get("GROK_INPUT_COST_PER_MILLION", "2"))
+OUTPUT_COST_PER_MILLION = float(os.environ.get("GROK_OUTPUT_COST_PER_MILLION", "6"))
+LONG_CONTEXT_TOKENS = int(os.environ.get("GROK_LONG_CONTEXT_TOKENS", "200000"))
+LONG_CONTEXT_MULTIPLIER = float(os.environ.get("GROK_LONG_CONTEXT_MULTIPLIER", "2"))

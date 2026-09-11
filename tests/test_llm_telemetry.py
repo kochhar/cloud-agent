@@ -80,9 +80,15 @@ class LlmTelemetryTests(unittest.TestCase):
             mock.patch.object(llm.telemetry, "finish_llm_attempt") as finish,
             mock.patch.object(llm.time, "sleep"),
         ):
-            reply = llm._grok([{"role": "user", "content": "hello"}], "session-id")
+            ticks = mock.Mock()
+            reply = llm._grok(
+                [{"role": "user", "content": "hello"}],
+                "session-id",
+                on_attempt=ticks,
+            )
 
         self.assertEqual(reply.text, "done")
+        self.assertEqual(ticks.call_count, 3)
         self.assertEqual(start.call_count, 2)
         first_call_id = start.call_args_list[0].kwargs["call_id"]
         self.assertEqual(start.call_args_list[1].kwargs["call_id"], first_call_id)
@@ -92,14 +98,18 @@ class LlmTelemetryTests(unittest.TestCase):
         self.assertEqual(finish.call_args_list[1].kwargs["outcome"], "success")
         self.assertEqual(finish.call_args_list[1].kwargs["input_tokens"], 120)
 
-    def test_cost_requires_a_complete_price_snapshot(self) -> None:
+    def test_cost_uses_grok_card_and_doubles_in_long_context(self) -> None:
         config.GROK_INPUT_COST_PER_MILLION = 2.0
-        config.GROK_OUTPUT_COST_PER_MILLION = 10.0
+        config.GROK_OUTPUT_COST_PER_MILLION = 6.0
+        config.GROK_LONG_CONTEXT_TOKENS = 200_000
+        config.GROK_LONG_CONTEXT_MULTIPLIER = 2.0
         self.assertEqual(
-            telemetry._estimated_cost(1_000_000, 100_000), Decimal("3.0")
+            telemetry._estimated_cost(1_000_000, 100_000), Decimal("5.2")
         )
-        config.GROK_OUTPUT_COST_PER_MILLION = None
-        self.assertIsNone(telemetry._estimated_cost(1_000_000, 100_000))
+        self.assertEqual(
+            telemetry._estimated_cost(1_000, 100), Decimal("0.0026")
+        )
+        self.assertIsNone(telemetry._estimated_cost(None, 100))
 
 
 if __name__ == "__main__":

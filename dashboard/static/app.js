@@ -104,7 +104,7 @@ function render(data) {
       <div class="metric">${dollars(cost.cost_per_completed_turn_usd)}</div>
       <div class="stats">
         <div class="stat"><span>Window cost</span><strong>${dollars(cost.estimated_cost_usd)}</strong></div>
-        <div class="stat"><span>Priced attempts</span><strong>${number(cost.priced_attempts)}</strong></div>
+        <div class="stat"><span>Tokens in / out</span><strong>${number(cost.input_tokens)} / ${number(cost.output_tokens)}</strong></div>
       </div>
       <p class="definition">${cost.definition}</p>`;
   }

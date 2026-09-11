@@ -175,8 +175,8 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertEqual(data["tiles"]["llm"]["final_call_error_rate"], 0.5)
             self.assertEqual(data["tiles"]["llm"]["p95_ms"], 1000)
             self.assertTrue(data["tiles"]["cost"]["available"])
-            self.assertEqual(
-                data["tiles"]["cost"]["cost_per_completed_turn_usd"], 0.03
+            self.assertAlmostEqual(
+                data["tiles"]["cost"]["cost_per_completed_turn_usd"], 0.0026
             )
             self.assertEqual(client.get("/healthz").status_code, 200)
             self.assertEqual(client.get("/").status_code, 200)

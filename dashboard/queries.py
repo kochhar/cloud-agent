@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from . import config
+
 
 def _number(value: Any) -> float | int | None:
     if value is None:
@@ -125,11 +127,35 @@ def collect_overview(conn, hours: int) -> dict:
     ).fetchall()
     llm["errors"] = [_row_numbers(row) for row in llm_errors]
 
-    cost_available = (
-        llm["successful_attempts"] > 0
-        and llm["priced_attempts"] == llm["successful_attempts"]
-        and completed > 0
-    )
+    priced = conn.execute(
+        """
+        SELECT coalesce(sum(
+                   (coalesce(input_tokens, 0) * %s
+                    + coalesce(output_tokens, 0) * %s)
+                   * CASE WHEN input_tokens >= %s THEN %s ELSE 1 END
+                   / 1000000.0
+               ), 0) AS estimated_cost_usd,
+               count(*) FILTER (
+                   WHERE outcome = 'success'
+                     AND input_tokens IS NOT NULL
+                     AND output_tokens IS NOT NULL
+               ) AS priced_attempts
+          FROM llm_attempts
+         WHERE started_at >= now() - (%s * interval '1 hour')
+           AND outcome = 'success'
+        """,
+        (
+            config.INPUT_COST_PER_MILLION,
+            config.OUTPUT_COST_PER_MILLION,
+            config.LONG_CONTEXT_TOKENS,
+            config.LONG_CONTEXT_MULTIPLIER,
+            hours,
+        ),
+    ).fetchone()
+    priced = _row_numbers(priced)
+    llm["estimated_cost_usd"] = priced["estimated_cost_usd"]
+    llm["priced_attempts"] = priced["priced_attempts"]
+    cost_available = priced["priced_attempts"] > 0 and completed > 0
 
     active_states = conn.execute(
         """
@@ -347,14 +373,16 @@ def collect_overview(conn, hours: int) -> dict:
                 ),
                 "priced_attempts": llm["priced_attempts"],
                 "successful_attempts": llm["successful_attempts"],
+                "input_tokens": llm["input_tokens"],
+                "output_tokens": llm["output_tokens"],
                 "reason": (
                     None
                     if cost_available
-                    else "Configure both model token prices and complete a turn."
+                    else "Need priced token usage and at least one completed turn."
                 ),
                 "definition": (
-                    "Window model cost divided by completed turn outcomes in "
-                    "the same window; not a per-turn attribution."
+                    "Window model cost at the configured grok-4.6 rates, "
+                    "divided by completed turn outcomes. Not per-turn attribution."
                 ),
             },
             "reexecution": {
