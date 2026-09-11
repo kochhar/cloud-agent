@@ -5,6 +5,7 @@
    there is no CORS to arrange and no base URL to configure. */
 
 const $ = (id) => document.getElementById(id);
+const API_BASE = "/api";
 
 // The control plane holds a poll for 25 seconds, so a feed request sitting
 // open is the normal case rather than a stall. Everything else is quick.
@@ -51,7 +52,7 @@ class ControlPlaneError extends Error {
 }
 
 async function call(method, path, body, signal) {
-  const response = await fetch(path, {
+  const response = await fetch(`${API_BASE}${path}`, {
     method,
     signal,
     headers: body ? { "Content-Type": "application/json" } : undefined,
@@ -123,6 +124,18 @@ function argsSummary(args) {
     .join(" ");
 }
 
+// The epoch and reason behind a sandbox lifecycle line, as a trailing aside
+// so the sentence in front of it stays readable.
+function where(payload) {
+  const parts = [];
+  if (payload.epoch !== undefined) parts.push(`epoch ${payload.epoch}`);
+  if (payload.reason) parts.push(payload.reason);
+  if (payload.replaced_by !== undefined) {
+    parts.push(`replaced by epoch ${payload.replaced_by}`);
+  }
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+
 function render(event) {
   const payload = event.payload || {};
 
@@ -183,15 +196,33 @@ function render(event) {
       );
       break;
 
+    case "sandbox_died":
+      // Reaped: it stopped answering, or announced a crash. The reason code
+      // stays visible, since it is the difference between a sandbox that went
+      // quiet and one that never started.
+      row("sandbox", `sandbox has disappeared${where(payload)}`, "bad");
+      break;
+
+    case "sandbox_exited":
+      // It said goodbye. status is how the control plane recorded that: a
+      // reason outside the clean set is still logged as a death.
+      row(
+        "sandbox",
+        payload.status === "dead"
+          ? `sandbox has disappeared${where(payload)}`
+          : `sandbox has left the building${where(payload)}`,
+        payload.status === "dead" ? "bad" : "",
+      );
+      break;
+
     default: {
-      // The sandbox lifecycle set, which only ever reaches the client. The
-      // state goes in the body rather than the tag, which is too narrow for
-      // "sandbox_replaced".
+      // The rest of the lifecycle: spawning and ready. The state goes in the
+      // body rather than the tag, which is too narrow for it.
       const detail = Object.entries(payload)
         .map(([k, v]) => `${k}=${v}`)
         .join(" ");
       const state = event.type.replace("sandbox_", "");
-      row("sandbox", `${state} ${detail}`.trim(), event.type === "sandbox_died" ? "bad" : "");
+      row("sandbox", `${state} ${detail}`.trim());
     }
   }
 }
@@ -373,6 +404,9 @@ function select(session) {
   setStatus("…");
   setLive(true);
   drawSessions();
+  // So the address bar is always a link to what is on screen, which is what
+  // makes it copyable into a bug report or a terminal.
+  history.replaceState(null, "", `?session=${session.id}`);
   follow(session.id);
 }
 
@@ -596,11 +630,32 @@ async function checkHealth() {
   }
 }
 
+// ---------- ---------- ----------
+// deep links
+// ---------- ---------- ----------
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ?session=<uuid> opens that session directly. The session was very likely
+// created somewhere else — the chaos harness prints one of these per session
+// — so there is nothing about it in localStorage: it gets remembered on the
+// way in and followed like any other. A uuid the control plane does not know
+// is handled by `follow`, which says so and forgets it again.
+function openRequestedSession() {
+  const asked = new URLSearchParams(location.search).get("session");
+  if (!asked || !UUID.test(asked)) return;
+
+  const known = store.sessions.find((s) => s.id === asked);
+  const session = known || { id: asked, branch: null };
+  if (!known) remember(session);
+  select(session);
+}
+
 $("repo-url").value = store.repoUrl;
 noteWorkspace();
 drawSessions();
 setLive(false);
 checkHealth();
+openRequestedSession();
 
 // A session opened in another tab, or left running when this one was closed,
 // is picked back up rather than lost.
