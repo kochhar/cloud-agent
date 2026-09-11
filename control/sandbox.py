@@ -78,14 +78,9 @@ def spawn(
             #
             # Read-then-check rather than a blind UPDATE, so each refusal
             # below can say which one it was.
-            cur.execute(
-                "SELECT status, current_epoch, repo_url, branch "
-                "FROM sessions WHERE id = %s FOR UPDATE",
-                (session_id,),
-            )
-            row = cur.fetchone()
-
-            if row is None:
+            try:
+                row = sessions._lock_session(cur, session_id)
+            except sessions.SessionNotFound:
                 raise SpawnRefused(f"no session {session_id}")
             if row["status"] in TERMINAL_STATUSES:
                 raise SpawnRefused(
@@ -127,14 +122,19 @@ def spawn(
                 repo_url = row["repo_url"]
                 branch = row["branch"]
 
+                # Always mark the previous epoch's live row replaced. ensure
+                # and spawn_for_pending pass no reason, and without this a
+                # ready row that registers in the window between ensure's
+                # liveness read and this lock stays 'ready' at a stale epoch
+                # forever: heartbeats 409, no nudge matches it.
+                # 'exited' is kept: that sandbox left rather than being
+                # replaced, and overwriting it would read as a death.
+                cur.execute(
+                    "UPDATE sandboxes SET status = 'replaced' "
+                    "WHERE session_id = %s AND epoch = %s AND status <> 'exited'",
+                    (session_id, previous),
+                )
                 if reason is not None:
-                    # 'exited' is kept: that sandbox left rather than being
-                    # replaced, and overwriting it would read as a death.
-                    cur.execute(
-                        "UPDATE sandboxes SET status = 'replaced' "
-                        "WHERE session_id = %s AND epoch = %s AND status <> 'exited'",
-                        (session_id, previous),
-                    )
                     sessions._emit(
                         cur,
                         session_id,
@@ -236,16 +236,7 @@ def register(session_id: str, epoch: int, container_id: str | None = None) -> di
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # Rejects both directions: a replaced sandbox, and an epoch the
-            # session never opened.
-            sessions._require_current_epoch(cur, session_id, epoch)
-
-            cur.execute(
-                "SELECT repo_url, branch, base_sha, last_accepted_sha "
-                "FROM sessions WHERE id = %s",
-                (session_id,),
-            )
-            session = cur.fetchone()
+            session = sessions._require_current(cur, session_id, epoch)
 
             cur.execute(
                 """
@@ -299,6 +290,9 @@ def heartbeat(
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # Locks the session, then the sandbox row. spawn holds the
+            # same order; a beat that updated sandboxes first could
+            # deadlock a replacement of this epoch.
             sessions._require_current_epoch(cur, session_id, epoch)
 
             cur.execute(

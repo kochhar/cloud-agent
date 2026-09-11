@@ -118,16 +118,25 @@ def use(client: Optional[Client]) -> None:
     _client = client
 
 
-def complete(context: list, session_id: Optional[str] = None) -> Reply:
+def complete(
+    context: list,
+    session_id: Optional[str] = None,
+    on_attempt: Optional[Callable[[], None]] = None,
+) -> Reply:
     """One model turn. An installed client wins, so tests never hit the network.
 
     `session_id` only labels log lines, and is not passed to an installed
     client, so the Client signature stays one argument.
+
+    `on_attempt` runs at the start of each HTTP try and again when a try
+    fails before the backoff sleep, so the caller can keep a liveness clock
+    without this module knowing about sessions. Installed clients do not
+    retry and do not call it.
     """
     if _client is not None:
         return _client(context)
     with log_context.bind(session_id=session_id):
-        return _grok(context, session_id)
+        return _grok(context, session_id, on_attempt=on_attempt)
 
 
 # ---------- ---------- ----------
@@ -153,7 +162,11 @@ def _session() -> httpx.Client:
     return _http
 
 
-def _grok(context: list, session_id: Optional[str] = None) -> Reply:
+def _grok(
+    context: list,
+    session_id: Optional[str] = None,
+    on_attempt: Optional[Callable[[], None]] = None,
+) -> Reply:
     if not config.GROK_API_KEY:
         raise NotConfigured(
             "GROK_API_KEY is unset; put it in .env or install a client with llm.use(...)"
@@ -171,6 +184,8 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
 
     last: Optional[Exception] = None
     for attempt in range(1, config.GROK_MAX_ATTEMPTS + 1):
+        if on_attempt is not None:
+            on_attempt()
         telemetry_id = (
             telemetry.start_llm_attempt(
                 session_id=session_id,
@@ -329,6 +344,10 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
                 break
 
         if attempt < config.GROK_MAX_ATTEMPTS:
+            # The try is over. Refresh before sleeping so a full-timeout
+            # attempt plus backoff cannot look like a dead caller.
+            if on_attempt is not None:
+                on_attempt()
             delay = _backoff(attempt)
             logger.warning(
                 "grok attempt %s/%s failed (%s); retrying in %.1fs",

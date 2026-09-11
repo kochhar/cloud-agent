@@ -100,15 +100,19 @@ def finish_llm_attempt(
 def _estimated_cost(
     input_tokens: int | None, output_tokens: int | None
 ) -> Decimal | None:
-    if (
-        input_tokens is None
-        or output_tokens is None
-        or config.GROK_INPUT_COST_PER_MILLION is None
-        or config.GROK_OUTPUT_COST_PER_MILLION is None
-    ):
+    if input_tokens is None or output_tokens is None:
         return None
     million = Decimal(1_000_000)
+    multiplier = (
+        Decimal(str(config.GROK_LONG_CONTEXT_MULTIPLIER))
+        if input_tokens >= config.GROK_LONG_CONTEXT_TOKENS
+        else Decimal(1)
+    )
     return (
-        Decimal(input_tokens) * Decimal(str(config.GROK_INPUT_COST_PER_MILLION))
-        + Decimal(output_tokens) * Decimal(str(config.GROK_OUTPUT_COST_PER_MILLION))
-    ) / million
+        (
+            Decimal(input_tokens) * Decimal(str(config.GROK_INPUT_COST_PER_MILLION))
+            + Decimal(output_tokens) * Decimal(str(config.GROK_OUTPUT_COST_PER_MILLION))
+        )
+        * multiplier
+        / million
+    )

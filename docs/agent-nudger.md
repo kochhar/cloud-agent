@@ -38,8 +38,10 @@ the intent to answer it is not.
 
 `_claim_thinking` moves `idle` or `executing` into `thinking`. It will not
 move `thinking` into anything. So an instance that dies inside the model call
-leaves a row that no future `advance` can ever claim. `thinking_since` exists
-for exactly this and nothing reads it.
+leaves a row that no future `advance` can ever claim. `thinking_since` is
+stamped on the claim and again at the start of each HTTP attempt, so a dead
+instance is visible after one timeout plus slack rather than after the
+worst-case retry budget.
 
 ### 1.4 A completed tool batch nobody advanced
 
@@ -431,13 +433,15 @@ outside any transaction, so a death mid-call left nothing behind. Re-running
 costs tokens and may produce different tool calls, and both are fine because
 the first attempt wrote nothing.
 
-**The bound is the one number here that cannot be guessed.** It has to exceed
-the worst-case *successful* turn, or this nudge will interrupt a live call and
-run the model twice on the same context. That worst case is
-`GROK_TIMEOUT_SECONDS × GROK_MAX_ATTEMPTS` plus the backoff between attempts —
-300 × 4 today, so roughly 20 minutes. Derive it from those two config values
-rather than writing a literal, so raising the provider timeout cannot silently
-make this nudge aggressive.
+**The bound is one live HTTP attempt, not the worst-case turn.**
+`thinking_since` is written on the claim and refreshed at the start of each
+provider try, so a process that is actually retrying keeps the clock current
+and a process that died does not. The deadline is therefore
+`GROK_TIMEOUT_SECONDS + 30s` — long enough that a live call cannot look
+expired, short enough that killing an instance is a minutes-scale recovery
+rather than a twenty-minute one. Derive it from the timeout rather than
+writing a literal, so raising the provider timeout cannot silently make this
+nudge aggressive.
 
 ### 5.3 `resume_stalled_batch` — item 3
 
@@ -474,8 +478,10 @@ The `NOT EXISTS` is supported by `tool_calls_pending_idx`.
 **Why this predicate has no false positives.** Walk the other ways to be in
 `'executing'`. Immediately after `advance` inserts a batch, the rows are
 `'pending'` — excluded. Mid-batch, at least one row is `'pending'` or
-`'dispatched'` — excluded. A batch that exhausted `MAX_TOOL_ATTEMPTS` set the
-session to `'failed'` — excluded. The only state that matches is a closed
+`'dispatched'` — excluded. A call that exhausted `MAX_TOOL_ATTEMPTS` is
+`'failed'` and does not fail the session; if it was the last open row the
+claim path writes the tool messages and defers `advance`, so this predicate
+does not match on a healthy close. The only state that matches is a closed
 batch with no assistant turn after it.
 
 **Why the grace period is small.** `advance`'s first act is `_claim_thinking`,
@@ -701,7 +707,8 @@ New values, in `control/config.py`:
 a process that died before making it.
 
 `thinking_deadline()` is derived rather than configured:
-`GROK_TIMEOUT_SECONDS × GROK_MAX_ATTEMPTS + slack`.
+`GROK_TIMEOUT_SECONDS + 30s`. The clock it reads is refreshed at the start of
+each provider attempt, so the bound is one live call, not the retry budget.
 
 ---
 

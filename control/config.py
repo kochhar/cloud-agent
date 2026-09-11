@@ -64,25 +64,20 @@ GROK_API_KEY: Optional[str] = os.environ.get("GROK_API_KEY") or None
 
 GROK_MODEL = _flag("GROK_MODEL", "grok-4.6")
 
-# Optional pricing snapshot used when each attempt is recorded. Leaving either
-# unset keeps cost null rather than presenting an unknown price as zero.
-GROK_INPUT_COST_PER_MILLION: Optional[float] = (
-    float(os.environ["GROK_INPUT_COST_PER_MILLION"])
-    if os.environ.get("GROK_INPUT_COST_PER_MILLION")
-    else None
-)
-GROK_OUTPUT_COST_PER_MILLION: Optional[float] = (
-    float(os.environ["GROK_OUTPUT_COST_PER_MILLION"])
-    if os.environ.get("GROK_OUTPUT_COST_PER_MILLION")
-    else None
-)
+# xAI grok-4.6 card: $2 / $6 per million below 200k prompt tokens, doubled at
+# or above that threshold for the whole request. Override when the bill changes.
+GROK_INPUT_COST_PER_MILLION = float(_flag("GROK_INPUT_COST_PER_MILLION", "2"))
+GROK_OUTPUT_COST_PER_MILLION = float(_flag("GROK_OUTPUT_COST_PER_MILLION", "6"))
+GROK_LONG_CONTEXT_TOKENS = int(_flag("GROK_LONG_CONTEXT_TOKENS", "200000"))
+GROK_LONG_CONTEXT_MULTIPLIER = float(_flag("GROK_LONG_CONTEXT_MULTIPLIER", "2"))
 
 # Seconds per HTTP attempt. advance() holds no lock while it waits, so a large
-# value costs a parked thread and nothing else.
-GROK_TIMEOUT_SECONDS = float(_flag("GROK_TIMEOUT", "300"))
+# value costs a parked thread and nothing else. thinking_since is refreshed at
+# the start of each attempt, so this is also the bound a live turn needs.
+GROK_TIMEOUT_SECONDS = float(_flag("GROK_TIMEOUT", "240"))
 
-# Attempts per turn, including the first. With the timeout above, this sets
-# the worst case for one turn and therefore thinking_deadline().
+# Attempts per turn, including the first. Retries no longer stretch
+# thinking_deadline(); each attempt resets the clock.
 GROK_MAX_ATTEMPTS = int(_flag("GROK_MAX_ATTEMPTS", "4"))
 
 
@@ -98,9 +93,10 @@ LONG_POLL_SECONDS = float(_flag("LONG_POLL_SECONDS", "25"))
 # calls sooner and costs more queries per waiting sandbox.
 POLL_INTERVAL_SECONDS = float(_flag("POLL_INTERVAL_SECONDS", "0.5"))
 
-# Dispatches of a single tool call before the session fails. Counts sandbox
-# deaths, not command exit codes: a command that fails is a result, not a
-# retry.
+# Dispatches of a single tool call before that call is marked failed and
+# handed back to the model. Counts sandbox deaths, not command exit codes:
+# a command that fails is a result, not a retry. The session stays
+# executing so the rest of the batch can close.
 MAX_TOOL_ATTEMPTS = int(_flag("MAX_TOOL_ATTEMPTS", "3"))
 
 
@@ -128,17 +124,25 @@ MAX_SANDBOX_LOSSES = int(_flag("MAX_SANDBOX_LOSSES", "10"))
 ADVANCE_GRACE_SECONDS = float(_flag("ADVANCE_GRACE", "30"))
 
 # Model calls one instance runs for the nudger at once, each holding a thread
-# for a whole turn. Sessions over the cap wait for a later pass.
+# for a whole turn. Per process, not per cluster: three instances cap at
+# 3 × this, all racing _claim_thinking. Sessions over the cap wait for a
+# later pass.
 NUDGE_MAX_ADVANCES = int(_flag("NUDGE_MAX_ADVANCES", "8"))
+
+# Slack on top of one HTTP attempt. thinking_since moves at the start of
+# each attempt, so a live retry is indistinguishable from a first try.
+THINKING_DEADLINE_SLACK_SECONDS = 30.0
 
 
 def thinking_deadline() -> float:
-    """Seconds 'thinking' may last before a nudge treats the call as lost.
+    """Seconds since the last thinking_since bump before a nudge treats the
+    caller as gone.
 
-    Derived, not configured: too low and the nudge interrupts a live call and
-    runs the model twice on one context.
+    One HTTP attempt plus slack, not attempts × timeout: a live process
+    refreshes thinking_since when it starts each try. Too low and the nudge
+    interrupts that try and runs the model twice on one context.
     """
-    return GROK_TIMEOUT_SECONDS * GROK_MAX_ATTEMPTS + 120.0
+    return GROK_TIMEOUT_SECONDS + THINKING_DEADLINE_SLACK_SECONDS
 
 
 # ---------------------------------------------------------------------------

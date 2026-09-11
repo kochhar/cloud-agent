@@ -69,13 +69,7 @@ def add_user_message(session_id: str, content: str) -> dict:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             # Locked so the status cannot change underneath the append.
-            cur.execute(
-                "SELECT status FROM sessions WHERE id = %s FOR UPDATE", (session_id,)
-            )
-        
-            row = cur.fetchone()
-            if row is None:
-                raise SessionNotFound(session_id)
+            row = _lock_session(cur, session_id)
 
             status = row["status"]
             if status in TERMINAL_STATUSES:
@@ -89,7 +83,19 @@ def add_user_message(session_id: str, content: str) -> dict:
         # A session idle long enough loses its sandbox, so restore the
         # invariant before asking for work. Ordered the way create_session
         # orders it, so the container boots while the model thinks.
-        sandbox.ensure(session_id)
+        #
+        # The append already committed. A spawn refusal must not 409 the
+        # client: the message is in the log, a retry would duplicate it.
+        # spawn_for_pending is the backstop if this session later has tools
+        # and still no sandbox.
+        try:
+            sandbox.ensure(session_id)
+        except sandbox.SpawnRefused as exc:
+            logger.warning(
+                "session %s accepted a message but has no sandbox: %s",
+                session_id,
+                exc,
+            )
         advance(session_id)
         return {"advanced": True}
 
@@ -215,7 +221,11 @@ def advance(session_id: str) -> None:
 
     # Outside any transaction: this can take minutes and must hold no locks.
     try:
-        reply = llm.complete(context, session_id=session_id)
+        reply = llm.complete(
+            context,
+            session_id=session_id,
+            on_attempt=lambda: _touch_thinking(session_id),
+        )
     except Exception as exc:
         # Recorded on the session so the client hears about it on the feed.
         logger.exception("model call failed for session %s", session_id)
@@ -224,6 +234,7 @@ def advance(session_id: str) -> None:
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            _lock_session(cur, session_id)
             message_id = _append_message(
                 cur,
                 session_id,
@@ -284,16 +295,26 @@ class ActionNotDispatched(Exception):
 
 @log_context.correlated
 def claim_next_action(
-    session_id: str, epoch: int, timeout: float = config.LONG_POLL_SECONDS
+    session_id: str,
+    epoch: int,
+    timeout: float = config.LONG_POLL_SECONDS,
+    schedule: Callable[..., None] | None = None,
 ) -> dict:
     """Long-poll for the next tool call.
 
     Always reports the session status, because a null tool alone cannot
     distinguish "still thinking" from "there will never be another call".
+
+    `schedule` is the same hook record_action_result uses: exhausting
+    MAX_TOOL_ATTEMPTS can close a batch from this path, and advancing
+    inline would pin the sandbox's next-action request to a model call.
     """
     deadline = time.monotonic() + timeout
     while True:
-        status, action = _claim_one_action(session_id, epoch)
+        status, action, closed = _claim_one_action(session_id, epoch)
+        if closed:
+            _defer(schedule, advance, session_id)
+            return {"session_status": status, "tool": None}
         if action is not None:
             return {"session_status": status, "tool": action}
 
@@ -344,10 +365,10 @@ def record_action_result(
                  WHERE id = %s
                    AND session_id = %s
                    AND status = 'dispatched'
-                   AND epoch = (SELECT current_epoch FROM sessions WHERE id = %s)
+                   AND epoch = %s
                 RETURNING id AS action_id, name, message_id, exit_code, commit_sha, repeated AS repeated
                 """,
-                (result, exit_code, commit_sha, action_id, session_id, session_id),
+                (result, exit_code, commit_sha, action_id, session_id, epoch),
             )
             row = cur.fetchone()
                      
@@ -396,33 +417,11 @@ def record_action_result(
                 },
             )
 
-            cur.execute(
-                "SELECT count(*) AS open FROM tool_calls "
-                "WHERE session_id = %s AND message_id = %s "
-                "AND status IN ('pending', 'dispatched')",
-                (session_id, row["message_id"]),
-            )
-            if cur.fetchone()["open"]:
+            if _batch_open(cur, session_id, row["message_id"]):
                 # Parallel calls: only the last result of the batch advances.
                 return {"batch_complete": False}
 
-            # Batch is in. One tool message each, so the context replays
-            # against the provider's tool_call ids.
-            cur.execute(
-                "SELECT provider_call_id, name, result, exit_code, repeated, "
-                "attempts, status "
-                "FROM tool_calls WHERE session_id = %s AND message_id = %s "
-                "ORDER BY ordinal",
-                (session_id, row["message_id"]),
-            )
-            for call in cur.fetchall():
-                _append_message(
-                    cur,
-                    session_id,
-                    "tool",
-                    content=_tool_message(call),
-                    provider_call_id=call["provider_call_id"],
-                )
+            _write_tool_messages(cur, session_id, row["message_id"])
 
     # Outside the transaction, so the rows the model reads are committed first.
     _defer(schedule, advance, session_id)
@@ -437,7 +436,33 @@ def _defer(schedule: Callable[..., None] | None, function, *args) -> None:
         schedule(function, *args)
 
 
+def _lock_session(cur, session_id: str) -> dict:
+    """Take the session row. House lock order starts here.
+
+    sessions, then sandboxes, then tool_calls. A transaction that writes
+    either of the latter without this call first can deadlock with spawn,
+    which must hold the session to bump the epoch.
+
+    FOR UPDATE on a lock this transaction already owns is a no-op, so a
+    helper that locks internally is safe to call from a caller that already
+    locked. Missing session is SessionNotFound; callers that want a
+    different exception convert it.
+    """
+    cur.execute(
+        "SELECT id, status, current_epoch, repo_url, branch, "
+        "base_sha, last_accepted_sha, thinking_since "
+        "FROM sessions WHERE id = %s FOR UPDATE",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise SessionNotFound(session_id)
+    return row
+
+
 def _next_seq(cur, session_id: str, column: str) -> int:
+    # Caller already holds the session if this transaction has taken any
+    # other lock. This UPDATE is not a substitute for _lock_session.
     cur.execute(
         f"UPDATE sessions SET {column} = {column} + 1, updated_at = now() "
         "WHERE id = %s RETURNING " + column,
@@ -554,12 +579,22 @@ def _load_context(cur, session_id: str) -> list[dict]:
 
 
 def _set_status(cur, session_id: str, status: str, error: str | None = None) -> None:
+    _lock_session(cur, session_id)
     cur.execute(
         "UPDATE sessions SET status = %s, error = %s, "
         "thinking_since = CASE WHEN %s = %s THEN now() ELSE NULL END, "
         "updated_at = now() WHERE id = %s",
         (status, error, status, THINKING, session_id),
     )
+    if status == FAILED:
+        # A terminal session never assembles a batch, so anything still
+        # pending or dispatched would sit there forever and floor every
+        # "stranded work" gauge. done rows are already closed.
+        cur.execute(
+            "UPDATE tool_calls SET status = 'failed', completed_at = now() "
+            "WHERE session_id = %s AND status IN ('pending', 'dispatched')",
+            (session_id,),
+        )
     payload = {"status": status}
     if error:
         payload["error"] = error
@@ -579,7 +614,15 @@ def rescue_orphaned_calls(cur, session_id: str) -> list:
     attempts, epoch and dispatched_at are left alone: attempts is what keeps
     MAX_TOOL_ATTEMPTS a real ceiling and sets `repeated` on re-dispatch, and
     the other two record where the lost attempt went.
+
+    The session is locked first. spawn already holds it; FOR UPDATE on a
+    lock this transaction owns is a no-op. A missing session is a no-op:
+    the row is gone, so are its calls.
     """
+    try:
+        _lock_session(cur, session_id)
+    except SessionNotFound:
+        return []
     cur.execute(
         """
         UPDATE tool_calls SET status = 'pending'
@@ -634,17 +677,17 @@ def _claim_thinking(session_id: str) -> bool:
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # Parameterised, not inlined: a status that stopped matching here
-            # fails silently, leaving a session that never thinks again.
+            try:
+                row = _lock_session(cur, session_id)
+            except SessionNotFound:
+                return False
+            if row["status"] not in (IDLE, EXECUTING):
+                return False
             cur.execute(
                 "UPDATE sessions SET status = %s, thinking_since = now(), "
-                "updated_at = now() "
-                "WHERE id = %s AND status IN (%s, %s) "
-                "RETURNING id",
-                (THINKING, session_id, IDLE, EXECUTING),
+                "updated_at = now() WHERE id = %s",
+                (THINKING, session_id),
             )
-            if cur.fetchone() is None:
-                return False
             _emit(cur, session_id, "status", {"status": THINKING})
             return True
 
@@ -652,25 +695,21 @@ def _claim_thinking(session_id: str) -> bool:
 def _fail(session_id: str, error: str) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            try:
+                _lock_session(cur, session_id)
+            except SessionNotFound:
+                return
             _set_status(cur, session_id, FAILED, error)
 
 
 def _require_current(cur, session_id: str, epoch: int) -> dict:
-    """Status and epoch for a caller that is the live sandbox.
+    """Lock the session and refuse a sandbox whose epoch is not current.
 
-    One read, so the status a caller acts on was true when its epoch passed.
-
-    Equality, not "no older than". An epoch above current_epoch is not a
-    sandbox that fell behind, it is one that cannot exist, because the only
-    thing that opens an epoch is a spawn. Accepting it would let a caller
-    claim work and report results against an epoch nothing ever created.
+    Always locks. Heartbeat and register write sandboxes then emit (the
+    session row); spawn holds the session before it writes sandboxes. A
+    plain read here used to let those two run in opposite order.
     """
-    cur.execute(
-        "SELECT status, current_epoch FROM sessions WHERE id = %s", (session_id,)
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise SessionNotFound(session_id)
+    row = _lock_session(cur, session_id)
     if epoch != row["current_epoch"]:
         raise StaleEpoch(
             f"epoch {epoch} is not current, session {session_id} is at "
@@ -684,13 +723,82 @@ def _require_current_epoch(cur, session_id: str, epoch: int) -> int:
     return _require_current(cur, session_id, epoch)["current_epoch"]
 
 
-def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
+def _touch_thinking(session_id: str) -> None:
+    """Refresh thinking_since if this session still holds the turn.
+
+    Called at the start of each provider attempt and again when a try
+    fails, before the backoff sleep. A process that died mid-call stops
+    refreshing, and unwedge_thinking can fire after one timeout plus slack
+    instead of after every retry that call might have made. The status
+    predicate is the compare-and-swap: unwedge may have already released
+    this row.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                row = _lock_session(cur, session_id)
+            except SessionNotFound:
+                return
+            if row["status"] != THINKING:
+                return
+            cur.execute(
+                "UPDATE sessions SET thinking_since = now(), updated_at = now() "
+                "WHERE id = %s",
+                (session_id,),
+            )
+
+
+def _batch_open(cur, session_id: str, message_id) -> bool:
+    cur.execute(
+        "SELECT count(*) AS open FROM tool_calls "
+        "WHERE session_id = %s AND message_id = %s "
+        "AND status IN ('pending', 'dispatched')",
+        (session_id, message_id),
+    )
+    return bool(cur.fetchone()["open"])
+
+
+def _write_tool_messages(cur, session_id: str, message_id) -> None:
+    """One tool message per call in the batch, in model order.
+
+    Includes failed rows, so a call that exhausted MAX_TOOL_ATTEMPTS still
+    reaches the model. The provider requires a reply for every id on the
+    assistant message.
+    """
+    cur.execute(
+        "SELECT provider_call_id, name, result, exit_code, repeated, "
+        "attempts, status "
+        "FROM tool_calls WHERE session_id = %s AND message_id = %s "
+        "ORDER BY ordinal",
+        (session_id, message_id),
+    )
+    for call in cur.fetchall():
+        _append_message(
+            cur,
+            session_id,
+            "tool",
+            content=_tool_message(call),
+            provider_call_id=call["provider_call_id"],
+        )
+
+
+def _claim_one_action(
+    session_id: str, epoch: int
+) -> tuple[str, dict | None, bool]:
     """Hand the oldest pending call to exactly one caller.
 
     Returns the session status too, so the caller can tell "nothing pending
-    yet" from "nothing will ever be pending". SKIP LOCKED lets two sandboxes
-    polling at once take different rows. RETURNING names columns the way the
-    sandbox reads them, so the claimed row is the response body.
+    yet" from "nothing will ever be pending". The session row is locked
+    first so this cannot deadlock with spawn's rescue. SKIP LOCKED is how
+    two waiters on the same session pick different pending rows once they
+    have the session in turn. RETURNING names columns the way the sandbox
+    reads them, so the claimed row is the response body.
+
+    The third value is whether this claim closed the batch: a call that
+    hits MAX_TOOL_ATTEMPTS is failed rather than handed out, and if it was
+    the last open row the tool messages are written here so the model sees
+    them. The session stays executing; a command that keeps killing its
+    sandbox is something the model can route around.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -698,7 +806,10 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
             if status in TERMINAL_STATUSES:
                 # A cancelled session can still hold pending rows, and their
                 # results would never be accepted.
-                return status, None
+                return status, None, False
+                # A cancelled session can still hold pending rows, and their
+                # results would never be accepted.
+                return status, None, False
 
             cur.execute(
                 """
@@ -717,13 +828,14 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
                         ORDER BY created_at, ordinal
                         LIMIT 1
                           FOR UPDATE SKIP LOCKED)
-                RETURNING id AS action_id, name, args, attempts AS attempt, repeated
+                RETURNING id AS action_id, name, args, attempts AS attempt,
+                          repeated, message_id
                 """,
                 (epoch, session_id),
             )
             row = cur.fetchone()
             if row is None:
-                return status, None
+                return status, None, False
 
             if row["attempt"] > config.MAX_TOOL_ATTEMPTS:
                 cur.execute(
@@ -731,17 +843,37 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
                     "WHERE id = %s",
                     (row["action_id"],),
                 )
-                _set_status(
+                _emit(
                     cur,
                     session_id,
-                    FAILED,
-                    f"tool call {row['name']} failed after {row['attempt'] - 1} attempts",
+                    "tool_finished",
+                    {
+                        "action_id": str(row["action_id"]),
+                        "name": row["name"],
+                        "exit_code": None,
+                        "commit_sha": None,
+                        "repeated": row["repeated"],
+                        "failed": True,
+                    },
                 )
-                # Not the status read at entry: this call made it terminal, and
-                # the sandbox should exit on this response, not poll again.
-                return FAILED, None
+                if _batch_open(cur, session_id, row["message_id"]):
+                    return status, None, False
+                _write_tool_messages(cur, session_id, row["message_id"])
+                return status, None, True
 
-            return status, row
+            # message_id is only for the fail path above; the sandbox
+            # contract is the columns RETURNING already named.
+            return (
+                status,
+                {
+                    "action_id": row["action_id"],
+                    "name": row["name"],
+                    "args": row["args"],
+                    "attempt": row["attempt"],
+                    "repeated": row["repeated"],
+                },
+                False,
+            )
 
 
 def _already_accepted(cur, session_id: str, action_id: str, epoch: int) -> bool:

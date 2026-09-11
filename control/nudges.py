@@ -307,6 +307,13 @@ class SessionNudge(Nudge):
         with log_context.bind(session_id=session_id):
             with pool.connection() as conn:
                 with conn.cursor() as cur:
+                    try:
+                        row = sessions._lock_session(cur, session_id)
+                    except sessions.SessionNotFound:
+                        return None
+                    if row["status"] != THINKING:
+                        return None
+
                     cur.execute(
                         "SELECT EXISTS (SELECT 1 FROM tool_calls "
                         " WHERE session_id = %s "
@@ -363,11 +370,14 @@ class SessionNudge(Nudge):
 # Advances this instance is running, and the cap on them. Not a correctness
 # guard — _claim_thinking is — but a scan runs every interval while an advance
 # takes minutes, so without it a backlog grows a thread per pass.
+# The cap is per process: NUDGE_MAX_ADVANCES = 8 with three instances is 24
+# concurrent advances, all racing _claim_thinking.
 _advancing: set = set()
 _advancing_lock = threading.Lock()
 
 
 def _reserve(session_id: str) -> bool:
+    """Take a slot on this process. The cap is not cluster-wide."""
     with _advancing_lock:
         if session_id in _advancing:
             return False

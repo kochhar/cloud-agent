@@ -244,13 +244,19 @@ def register_sandbox(session_id: str, body: RegisterRequest) -> Dict[str, Any]:
 
 
 @app.get("/sandbox/{session_id}/next-action")
-def get_next_action(session_id: str, epoch: int = Query(..., ge=0)) -> Dict[str, Any]:
+def get_next_action(
+    session_id: str,
+    background: BackgroundTasks,
+    epoch: int = Query(..., ge=0),
+) -> Dict[str, Any]:
     """Long-poll for the pending tool call.
 
     A null tool means the hold expired with nothing pending, unless
     session_status is terminal, in which case the sandbox should exit.
     """
-    return {"ok": True, **sessions.claim_next_action(session_id, epoch)}
+    return {"ok": True, **sessions.claim_next_action(
+        session_id, epoch, schedule=background.add_task
+    )}
 
 
 @app.post("/sandbox/{session_id}/actions/{action_id}/result")

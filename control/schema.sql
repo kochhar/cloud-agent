@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     message_seq         int         NOT NULL DEFAULT 0,
     event_seq           int         NOT NULL DEFAULT 0,
 
-    thinking_since      timestamptz,                -- set on entry to 'thinking'
+    thinking_since      timestamptz,                -- refreshed at the start of each model attempt
     error               text,
 
     created_at          timestamptz NOT NULL DEFAULT now(),
