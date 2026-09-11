@@ -185,7 +185,7 @@ The threshold lives in the container because the container is what it spends. Th
 
 Only `failed` and `cancelled` close a session for good.
 
-**Sandbox dies.** cursord heartbeats every thirty seconds. When heartbeats stop for longer than the threshold — ninety seconds, three missed beats — the session is marked `sandbox_dead` and a replacement is spawned at a new epoch.
+**Sandbox dies.** cursord heartbeats every ten seconds. When heartbeats stop for longer than the threshold — thirty seconds, three missed beats — the session is marked `sandbox_dead` and a replacement is spawned at a new epoch.
 
 The two numbers are one decision written in two places, and the threshold has to stay well above the interval. A threshold below three missed beats replaces sandboxes that are merely slow, and each wrong replacement re-runs the tool call the original was in the middle of. It clones, checks out the branch, and starts polling. Any pending tool call is still pending and gets dispatched to the new sandbox.
 
