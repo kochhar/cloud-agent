@@ -1,7 +1,7 @@
 # project1 — local cloud agent
 
 Control plane for a local version of a cloud coding agent. Design lives in
-[docs/local-cloud-agent-architecture.md](docs/local-cloud-agent-architecture.md).
+[docs/agent-architecture.md](docs/agent-architecture.md).
 
 ## Layout
 
@@ -17,6 +17,7 @@ Control plane for a local version of a cloud coding agent. Design lives in
 | `db/` | Pool, transaction helpers, and the executable schema. |
 | `agent/` | The container image and `cursord`, the daemon inside it. |
 | `client/` | The browser client. Enqueues tasks and renders the event feed. |
+| `dashboard/` | Standalone, read-only fleet operations dashboard. |
 
 `control/schema.sql` is the schema. It is applied by hand rather than on
 boot:
@@ -97,6 +98,23 @@ a closed tab loses nothing. The feed stops on a terminal status.
 Send, Diff and Cancel are wired to the routes in the doc and currently report
 that the control plane has not built them, which is true: they are 501 in
 `app.py`.
+
+## Operations dashboard
+
+The fleet dashboard is a separate application rather than another control
+route. It reads fixed, bounded aggregations from Postgres through its own
+read-only pool, so it remains agnostic to how many control instances are
+running.
+
+```bash
+.venv/bin/pip install -r dashboard/requirements.txt
+PYTHONPATH=. .venv/bin/uvicorn dashboard.app:app \
+  --host 127.0.0.1 --port 8001
+```
+
+Open http://127.0.0.1:8001/ui/. Metric definitions, read-only database setup,
+reverse-proxy deployment, structured log fields, and known telemetry gaps are
+documented in [docs/observability.md](docs/observability.md).
 
 ## Checks
 
