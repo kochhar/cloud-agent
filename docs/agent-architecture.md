@@ -40,6 +40,11 @@ Key non-functional requirements
 
 **Postgres.** Source of truth for conversation and session state.
 
+**Operations dashboard.** A standalone read-only service over Postgres. It
+serves fleet aggregates independently of any control-plane instance; the
+per-session event viewer remains the client served by control. See
+[observability.md](observability.md).
+
 **Bare git repo on the host.** Stands in for GitHub. Source of truth for file state.
 
 ## State management
