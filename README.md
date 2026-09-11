@@ -112,9 +112,12 @@ PYTHONPATH=. .venv/bin/uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8001
 ```
 
-Open http://127.0.0.1:8001/ui/. Metric definitions, read-only database setup,
-reverse-proxy deployment, structured log fields, and known telemetry gaps are
-documented in [docs/observability.md](docs/observability.md).
+Open http://127.0.0.1:8001/. The snapshot is `GET /api/overview` next to
+that page. Behind the local cluster proxy the same pair is
+http://127.0.0.1/ops/dash/ and `GET /ops/dash/api/overview` — origin
+`/api` belongs to the control plane. Metric definitions, read-only database
+setup, reverse-proxy deployment, structured log fields, and known telemetry
+gaps are documented in [docs/observability.md](docs/observability.md).
 
 ## Checks
 
