@@ -7,7 +7,7 @@ import config
 pool = ConnectionPool(
     config.DATABASE_URL,
     min_size=2,
-    max_size=20,
+    max_size=50,
     kwargs={"row_factory": dict_row},
     open=True,
 )
