@@ -11,9 +11,9 @@ const $ = (id) => document.getElementById(id);
 const RETRY_BASE_MS = 500;
 const RETRY_MAX_MS = 5000;
 
-// Nothing more is coming after these. `awaiting_user` is not one of them: the
-// agent has finished its turn, but a reply would start it again.
-const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+// Nothing more is coming after these. `idle` is not one of them: the agent has
+// finished its turn, but a reply would start it again.
+const TERMINAL = new Set(["failed", "cancelled"]);
 
 const store = {
   get repoUrl() {
@@ -110,6 +110,7 @@ function row(tag, body, className) {
   // Only chase the bottom if the reader is already there; scrolling back to
   // read a tool result should not be yanked away by the next event.
   if (atBottom) feed.scrollTop = feed.scrollHeight;
+  return li;
 }
 
 function argsSummary(args) {
@@ -182,6 +183,109 @@ function render(event) {
       row("sandbox", `${state} ${detail}`.trim(), event.type === "sandbox_died" ? "bad" : "");
     }
   }
+}
+
+// ---------- ---------- ----------
+// the diff
+// ---------- ---------- ----------
+const shortSha = (sha) => (sha ? sha.slice(0, 8) : "?");
+
+function note(text) {
+  const el = document.createElement("div");
+  el.className = "diff-note";
+  el.textContent = text;
+  return el;
+}
+
+/* What comes back is a stat and a bounded preview, never the whole patch:
+   git lives in the sandbox, and the control plane only keeps what the sandbox
+   reported. `url` is how the reader gets to the rest of it. */
+function renderDiff(diff) {
+  const parts = [];
+  const headline = document.createElement("div");
+  headline.className = "diff-stat";
+
+  if (!diff.head_sha) {
+    // No accepted commit: every tool call so far was a read, or none has
+    // finished. Not an error, and not worth a stat line of zeroes.
+    headline.textContent = "nothing committed yet, so there is no diff";
+    parts.push(headline);
+    row("diff", parts);
+    return;
+  }
+
+  const changed = diff.files_changed === 1 ? "1 file changed" : `${diff.files_changed} files changed`;
+  headline.textContent =
+    `${changed}, +${diff.additions} −${diff.deletions}` +
+    `  ${shortSha(diff.base_sha)}..${shortSha(diff.head_sha)}`;
+  parts.push(headline);
+
+  const files = diff.files || [];
+  if (files.length) {
+    const table = document.createElement("div");
+    table.className = "diff-files";
+    for (const file of files) {
+      const path = document.createElement("span");
+      path.className = "path";
+      path.textContent = file.path;
+      table.append(path);
+
+      if (file.binary) {
+        // numstat reports no line counts for a binary file, so there is
+        // nothing to put in the two numeric columns.
+        const binary = document.createElement("span");
+        binary.className = "binary";
+        binary.textContent = "binary";
+        table.append(binary);
+      } else {
+        const added = document.createElement("span");
+        added.className = "add";
+        added.textContent = `+${file.additions}`;
+        const removed = document.createElement("span");
+        removed.className = "del";
+        removed.textContent = `−${file.deletions}`;
+        table.append(added, removed);
+      }
+    }
+    parts.push(table);
+  }
+
+  // The totals above count every file; the list is capped. Say which.
+  if (diff.files_truncated) {
+    const hidden = diff.files_changed - files.length;
+    parts.push(note(`… ${hidden} more file${hidden === 1 ? "" : "s"}, counted above but not listed`));
+  }
+
+  if (diff.url) {
+    const link = document.createElement("a");
+    link.href = diff.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "view the full patch ↗";
+    const wrapper = document.createElement("div");
+    wrapper.className = "diff-note";
+    wrapper.append(link);
+    parts.push(wrapper);
+  }
+
+  if (diff.preview) {
+    const preview = document.createElement("div");
+    preview.className = "output";
+    preview.textContent = diff.preview;
+    parts.push(preview);
+  }
+
+  if (diff.preview_truncated) {
+    parts.push(
+      note(
+        diff.url
+          ? "… preview truncated, the link has the rest"
+          : "… preview truncated, and this remote has no compare URL, so the preview is all there is"
+      )
+    );
+  }
+
+  row("diff", parts);
 }
 
 // ---------- ---------- ----------
@@ -289,14 +393,44 @@ function drawSessions() {
   for (const session of list) {
     const li = document.createElement("li");
     if (current && session.id === current.id) li.className = "current";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = session.prompt || session.id;
-    button.title = `${session.id}\n${session.prompt || ""}`;
-    button.addEventListener("click", () => select(session));
-    li.append(button);
+
+    const pick = document.createElement("button");
+    pick.type = "button";
+    pick.className = "pick";
+    pick.textContent = session.prompt || session.id;
+    pick.title = `${session.id}\n${session.prompt || ""}`;
+    pick.addEventListener("click", () => select(session));
+
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.className = "drop";
+    drop.textContent = "×";
+    // Worth being explicit: this removes a bookmark, not a session. There is
+    // no delete route, and the row in Postgres is untouched.
+    drop.title = "Remove from this list. The session itself is not deleted.";
+    drop.setAttribute("aria-label", `Remove session ${session.id} from the list`);
+    drop.addEventListener("click", () => {
+      const wasCurrent = current && current.id === session.id;
+      forget(session.id);
+      if (wasCurrent) clearPane();
+    });
+
+    li.append(pick, drop);
     ul.append(li);
   }
+}
+
+/** Back to the state before any session was picked. */
+function clearPane() {
+  stopFollowing();
+  current = null;
+  $("session-id").textContent = "no session";
+  $("branch").textContent = "";
+  $("feed").replaceChildren();
+  // Not "idle": that is a status the control plane sends for a session whose
+  // turn has ended, and this pane has no session at all.
+  setStatus("no session");
+  setLive(false);
 }
 
 function setStatus(status) {
@@ -304,8 +438,8 @@ function setStatus(status) {
   pill.textContent = status;
   pill.className = "pill";
   if (status === "failed" || status === "cancelled") pill.classList.add("bad");
-  else if (status === "completed" || status === "awaiting_user") pill.classList.add("good");
-  else if (status !== "idle") pill.classList.add("busy");
+  else if (status === "idle") pill.classList.add("good");
+  else if (status !== "no session") pill.classList.add("busy");
 }
 
 /** Enable or disable everything that only makes sense with a live session. */
@@ -392,11 +526,21 @@ $("message-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const content = $("message").value.trim();
   if (!content || !current) return;
+
+  // Echoed before the request rather than after it. A user message on an idle
+  // session advances the loop inside the same request, so awaiting it first
+  // would put your line under the reply it prompted. It is echoed at all
+  // because the control plane appends user messages without emitting an
+  // event: they reach the model, never the feed.
+  const echo = row("you", content, "you");
+  $("message").value = "";
+
   try {
     await call("POST", `/sessions/${current.id}/messages`, { content });
-    row("you", content);
-    $("message").value = "";
   } catch (error) {
+    // The line stays, marked, so the text is not lost with the toast.
+    echo.classList.add("bad");
+    echo.querySelector(".tag").textContent = "not sent";
     reportFailure(error);
   }
 });
@@ -413,8 +557,7 @@ $("cancel-btn").addEventListener("click", async () => {
 $("diff-btn").addEventListener("click", async () => {
   if (!current) return;
   try {
-    const body = await call("GET", `/sessions/${current.id}/diff`);
-    row("diff", body.diff || JSON.stringify(body, null, 2));
+    renderDiff(await call("GET", `/sessions/${current.id}/diff`));
   } catch (error) {
     reportFailure(error);
   }

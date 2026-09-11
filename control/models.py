@@ -12,14 +12,16 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 # sessions.status, mirroring the CHECK constraint on the table
-AWAITING_USER = "awaiting_user"  # idle, needs a user message
+IDLE = "idle"                    # no sandbox; the turn ended, waiting on the user
 THINKING = "thinking"            # an instance is inside the LLM call
 EXECUTING = "executing"          # tool calls outstanding
-COMPLETED = "completed"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
-TERMINAL_STATUSES = frozenset({COMPLETED, FAILED, CANCELLED})
+# Takes no more input, ever. 'idle' is deliberately not here: a turn that ends
+# without tool calls is finished, not closed, and the next user message picks
+# the same session up again.
+TERMINAL_STATUSES = frozenset({FAILED, CANCELLED})
 
 
 @dataclass(frozen=True)

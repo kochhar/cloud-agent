@@ -57,6 +57,21 @@ class Action:
     repeated: bool
 
 
+@dataclass(frozen=True)
+class Poll:
+    """One answer to the long poll.
+
+    A null tool means only that nothing was pending when the hold expired,
+    which is the ordinary case while the model is thinking. What the sandbox
+    does about that depends on `session_status`, which is why the status is
+    handed back rather than swallowed here: 'executing' and 'idle' both
+    arrive with no tool, and only one of them is a reason to go home.
+    """
+
+    session_status: Optional[str]
+    tool: Optional[Action]
+
+
 class Control:
     def __init__(self) -> None:
         self._http = httpx.AsyncClient(
@@ -91,19 +106,66 @@ class Control:
             resume_sha=body.get("resume_sha") or body.get("base_sha"),
         )
 
-    async def heartbeat(self) -> None:
-        """Liveness. Raises StaleEpoch when the control plane has moved on."""
-        await self._request(
-            self._http.post(f"{self._base}/heartbeat", json={"epoch": config.EPOCH})
-        )
+    async def heartbeat(self) -> bool:
+        """Liveness. True if the beat landed.
+
+        A 409 raises StaleEpoch: a newer sandbox owns the session, and that
+        is the one heartbeat failure that means something. Every other
+        failure — a control plane restarting, a 5xx, a timeout — is reported
+        back rather than raised, because the caller is a loop and taking the
+        container down over it would throw away work in flight.
+
+        Not routed through `_retrying` on purpose. A heartbeat is only worth
+        anything at the moment it is sent; resending a stale one says nothing
+        the next tick will not say better, and a retry that outlasts the
+        interval would stall the beat it is standing in for.
+        """
+        try:
+            await self._request(
+                self._http.post(f"{self._base}/heartbeat", json={"epoch": config.EPOCH})
+            )
+        except httpx.HTTPError as exc:
+            logger.debug("heartbeat failed: %s", exc)
+            return False
+        return True
+
+    async def report_exit(self, reason: str) -> None:
+        """The last beat: this container is stopping, and why.
+
+        Without it a deliberate shutdown is indistinguishable from a crash,
+        and the reaper spends its death threshold waiting to replace a
+        sandbox that finished on purpose.
+
+        Best effort, and never retried. The process is already leaving, and
+        anything that failed here is something the reaper will work out from
+        the heartbeat that stops arriving. That includes a stale epoch: the
+        control plane has replaced us, which is exactly what we were about
+        to tell it.
+        """
+        try:
+            await self._request(
+                self._http.post(
+                    f"{self._base}/heartbeat",
+                    json={
+                        "epoch": config.EPOCH,
+                        "exiting": True,
+                        "reason": reason,
+                    },
+                )
+            )
+        except (httpx.HTTPError, StaleEpoch) as exc:
+            logger.debug("exit report failed: %s", exc)
 
     # -- work --------------------------------------------------------------
 
-    async def next_action(self) -> Optional[Action]:
+    async def next_action(self) -> Poll:
         """Long-poll for the pending tool call.
 
-        None means the hold expired with nothing to do, which is the common
-        case while the model is thinking or the session is awaiting the user.
+        'failed' and 'cancelled' raise here rather than being returned: the
+        session is closed, nothing further can be accepted from this
+        container, and there is no policy left for the caller to apply.
+        'idle' is not one of them — the session can still be resumed by a
+        user message, so how long to wait for one is the work loop's call.
         """
         body = await self._retrying(
             "next-action",
@@ -112,22 +174,20 @@ class Control:
             ),
         )
 
-        # TODO(contract): the doc has no way to say "stop polling, we're done".
-        # A null tool currently means both "nothing yet" and "session over", so
-        # a finished session leaves its container polling forever. Proposing
-        # the response also carry the session status.
-        if body.get("session_status") in {"completed", "failed", "cancelled"}:
-            raise SessionFinished(body["session_status"])
+        status = body.get("session_status")
+        if status in {"failed", "cancelled"}:
+            raise SessionFinished(status)
 
         tool = body.get("tool")
-        if tool is None:
-            return None
-        return Action(
-            action_id=tool["action_id"],
-            name=tool["name"],
-            args=tool.get("args") or {},
-            attempt=tool.get("attempt", 1),
-            repeated=tool.get("repeated", False),
+        return Poll(
+            session_status=status,
+            tool=None if tool is None else Action(
+                action_id=tool["action_id"],
+                name=tool["name"],
+                args=tool.get("args") or {},
+                attempt=tool.get("attempt", 1),
+                repeated=tool.get("repeated", False),
+            ),
         )
 
     async def report_result(
@@ -136,13 +196,19 @@ class Control:
         *,
         result: str,
         exit_code: Optional[int],
-        commit_sha: Optional[str],
+        base_sha: Optional[str] = None,
+        checkpoint=None,
     ) -> None:
         """Hand back a tool result. This is the call that advances the loop.
 
         Retried hard, because the work is already done and the commit is
         already pushed: giving up here is what turns a completed tool call
         into a duplicated one after recovery.
+
+        The checkpoint rides along because the control plane has no clone and
+        no way to look any of this up for itself. `base_sha` goes with every
+        result, commit or not, so the session knows where its work started
+        from the first one rather than from the first write.
         """
         await self._retrying(
             "result",
@@ -152,7 +218,10 @@ class Control:
                     "epoch": config.EPOCH,
                     "result": result,
                     "exit_code": exit_code,
-                    "commit_sha": commit_sha,
+                    "base_sha": base_sha,
+                    "commit_sha": checkpoint.sha if checkpoint else None,
+                    "diff_preview": checkpoint.preview if checkpoint else None,
+                    "diff_stat": checkpoint.stat if checkpoint else None,
                 },
             ),
         )

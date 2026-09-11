@@ -11,3 +11,10 @@ pool = ConnectionPool(
     kwargs={"row_factory": dict_row},
     open=True,
 )
+
+
+def health() -> dict:
+    """Prove the pool can hand out a connection that can run a query."""
+    with pool.connection() as conn:
+        row = conn.execute("SELECT version(), current_database()").fetchone()
+    return {"database": row["current_database"], "version": row["version"]}

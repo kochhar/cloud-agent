@@ -13,15 +13,34 @@ CREATE TABLE IF NOT EXISTS sessions (
 
     repo_url            text        NOT NULL,
     branch              text        NOT NULL,
-    base_sha            text,                       -- set at first register
+    base_sha            text,                       -- where the sandbox's clone started
     last_accepted_sha   text,                       -- newest SHA from a live epoch
 
-    status              text        NOT NULL DEFAULT 'awaiting_user'
+    -- Computed in the sandbox, which is the only side holding a clone, and
+    -- deliberately bounded: the full patch stays in the repository and the
+    -- client follows a compare link to it. This row is rewritten on every
+    -- commit, so nothing unbounded belongs in it.
+    diff_preview        text,                       -- first DIFF_PREVIEW_CHARS of base..head
+    diff_stat           jsonb,                      -- per-file counts and totals
+
+    -- 'idle' is the resting state and also the signal that the sandbox
+    -- should exit: a turn that ends without tool calls has nothing left to
+    -- run, and a container kept alive for a conversation that may never
+    -- continue is a container the reaper will eventually misjudge. The next
+    -- user message spawns a fresh epoch, which is the same rebuild recovery
+    -- already performs from last_accepted_sha.
+    --
+    -- It replaces both of the statuses that used to mean this. 'completed'
+    -- was never written by any code path, and 'awaiting_user' was already
+    -- documented here as "idle, needs a user message".
+    --
+    -- Three statuses tell a sandbox to stop: 'idle', 'failed', 'cancelled'.
+    -- Only the last two refuse a new user message.
+    status              text        NOT NULL DEFAULT 'idle'
                           CHECK (status IN (
-                            'awaiting_user',   -- idle, needs a user message
+                            'idle',            -- no sandbox; waiting on the user
                             'thinking',        -- an instance is inside the LLM call
                             'executing',       -- tool calls outstanding
-                            'completed',
                             'failed',
                             'cancelled')),
 
@@ -52,8 +71,14 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     epoch               int         NOT NULL,
 
     container_id        text,                       -- docker id, null until spawned
+
+    -- 'exited' is a sandbox that shut itself down on purpose, reported by
+    -- cursord on its way out when the session went idle. Distinct from
+    -- 'dead', which is a sandbox that stopped answering and was reaped:
+    -- collapsing the two would make every ordinary end-of-turn look like a
+    -- crash in this table.
     status              text        NOT NULL DEFAULT 'spawning'
-                          CHECK (status IN ('spawning','ready','dead','replaced')),
+                          CHECK (status IN ('spawning','ready','dead','replaced','exited')),
 
     last_heartbeat_at   timestamptz,
     created_at          timestamptz NOT NULL DEFAULT now(),
@@ -61,7 +86,9 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     UNIQUE (session_id, epoch)
 );
 
--- reaper: find sandboxes whose heartbeat has expired
+-- reaper: find sandboxes whose heartbeat has expired. A sandbox that
+-- reported its own exit leaves this index by changing status, so a clean
+-- shutdown cannot be read as an expired heartbeat and respawned.
 CREATE INDEX IF NOT EXISTS sandboxes_live_heartbeat_idx
     ON sandboxes (last_heartbeat_at)
     WHERE status = 'ready';
@@ -134,14 +161,72 @@ CREATE INDEX IF NOT EXISTS tool_calls_pending_idx
 CREATE TABLE IF NOT EXISTS events (
     session_id          uuid        NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     seq                 int         NOT NULL,       -- from sessions.event_seq
+    -- The sandbox lifecycle set is the client's only window onto a layer it
+    -- never talks to. 'sandbox_exited' is the ordinary end of that life,
+    -- kept apart from 'sandbox_died' so the feed can say the session
+    -- finished and its container left, rather than implying a crash every
+    -- time a turn ends.
     type                text        NOT NULL
                           CHECK (type IN (
                             'thinking','text','status',
                             'tool_started','tool_finished',
                             'sandbox_spawning','sandbox_ready',
-                            'sandbox_died','sandbox_replaced')),
+                            'sandbox_died','sandbox_replaced',
+                            'sandbox_exited')),
     payload             jsonb       NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
 
     PRIMARY KEY (session_id, seq)
 );
+
+-- ---------------------------------------------------------------
+-- in-place changes
+--
+-- Everything above is CREATE ... IF NOT EXISTS, which builds a new database
+-- and silently skips an existing one. A CHECK constraint that has to change
+-- therefore needs saying twice: once in the table above for a fresh
+-- database, and once here for the one already running.
+--
+-- Drop-then-add is what makes this idempotent, and the names are the ones
+-- Postgres generates for an inline CHECK, so these find the constraints
+-- whether the table was created before this section existed or after.
+--
+-- Applying this file is a deliberate act — nothing runs it on boot — and it
+-- must land with the code that writes the new values, not before it. The
+-- control plane writes 'awaiting_user' until that change ships, and this
+-- constraint rejects it.
+-- ---------------------------------------------------------------
+
+-- sessions gains the two columns the diff is served from. The CREATE TABLE
+-- above already declares them, which covers a database built from scratch
+-- and does nothing at all for one that already has a sessions table.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS diff_preview text;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS diff_stat    jsonb;
+
+-- sessions.status: 'awaiting_user' and 'completed' collapse into 'idle'.
+-- The constraint comes off first because the rows cannot hold the new value
+-- while the old one is still enforced.
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_status_check;
+
+UPDATE sessions SET status = 'idle' WHERE status IN ('awaiting_user', 'completed');
+
+ALTER TABLE sessions ALTER COLUMN status SET DEFAULT 'idle';
+
+ALTER TABLE sessions ADD CONSTRAINT sessions_status_check
+    CHECK (status IN ('idle','thinking','executing','failed','cancelled'));
+
+-- sandboxes.status: 'exited' joins it, for a sandbox that stopped on its own.
+ALTER TABLE sandboxes DROP CONSTRAINT IF EXISTS sandboxes_status_check;
+
+ALTER TABLE sandboxes ADD CONSTRAINT sandboxes_status_check
+    CHECK (status IN ('spawning','ready','dead','replaced','exited'));
+
+-- events.type: 'sandbox_exited' joins the lifecycle set, so the clean
+-- shutdown has something to say to the client.
+ALTER TABLE events DROP CONSTRAINT IF EXISTS events_type_check;
+
+ALTER TABLE events ADD CONSTRAINT events_type_check
+    CHECK (type IN ('thinking','text','status',
+                    'tool_started','tool_finished',
+                    'sandbox_spawning','sandbox_ready',
+                    'sandbox_died','sandbox_replaced','sandbox_exited'));

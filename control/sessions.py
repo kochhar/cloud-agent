@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 from db import pool
-from models import TERMINAL_STATUSES
+from models import IDLE, TERMINAL_STATUSES
 import config
 import llm
 import sandbox
@@ -19,6 +19,10 @@ class SessionNotFound(Exception):
     pass
 
 
+class SessionFinished(Exception):
+    """The session reached a terminal state and takes no more input."""
+
+
 class StaleEpoch(Exception):
     pass
 
@@ -27,17 +31,19 @@ class StaleEpoch(Exception):
 # client-facing API
 # ---------- ---------- ----------
 def create_session(repo_url: str, prompt:str) -> dict:
+    """Create a new session, spawn a container and advance the loop."""
     branch = f"agent/{uuid.uuid4().hex[:8]}"
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO sessions (repo_url, branch, status) "
-                "VALUES (%s, %s, 'awaiting_user') RETURNING id, branch",
+                "VALUES (%s, %s, 'idle') RETURNING id, branch",
                 (repo_url, branch),
             )
 
             row = cur.fetchone()
-            session_id = row["id"]
+            
+            session_id = str(row["id"])
             _append_message(cur, session_id, "system", llm.SYSTEM_PROMPT)
             _append_message(cur, session_id, "user", prompt)
             _emit(cur, session_id, "status", {"status": "starting"})
@@ -48,16 +54,124 @@ def create_session(repo_url: str, prompt:str) -> dict:
     return {"session_id": session_id, "branch": branch}
 
 
+def add_user_message(session_id: str, content: str) -> dict:
+    """Append a user message, and start the loop again if it is idle.
+
+    Appending and advancing are separate. A message that lands while calls 
+    are outstanding must not trigger a model because the model expects the 
+    tool results to follow the assistant message that asked for them.
+    
+    The message is in the log either way, so whichever request advances the 
+    loop next picks it up.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            # Locked FOR UPDATE so the status cannot change underneath the append.
+            cur.execute(
+                "SELECT status FROM sessions WHERE id = %s FOR UPDATE", (session_id,)
+            )
+        
+            row = cur.fetchone()
+            if row is None:
+                raise SessionNotFound(session_id)
+
+            status = row["status"]
+            if status in TERMINAL_STATUSES:
+                raise SessionFinished(
+                    f"session {session_id} is {status} and takes no more messages"
+                )
+
+            _append_message(cur, session_id, "user", content)
+
+    if status == IDLE:
+        advance(session_id)
+        return {"advanced": True}
+
+    # thinking or executing: something else is already running and will see
+    # this message when it reloads the context.
+    return {"advanced": False}
+
+
+def get_diff(session_id: str) -> dict:
+    """What changed, in summary, and where to read the rest of it.
+
+    A read and nothing else. Everything here was computed in the sandbox,
+    which is the only side of this system holding a clone, and written
+    alongside the SHA it describes when that result was accepted. So it
+    answers after the sandbox is gone and from an instance that has never
+    seen the repository.
+
+    The full patch is deliberately not here. It lives in the repository the
+    sandbox pushed to, and `url` is how a client gets to it.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT repo_url, branch, base_sha, last_accepted_sha, "
+                "diff_preview, diff_stat, status FROM sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        raise SessionNotFound(session_id)
+
+    base = row["base_sha"]
+    head = row["last_accepted_sha"]
+    stat = row["diff_stat"] or {}
+
+    return {
+        "branch": row["branch"],
+        "status": row["status"],
+        "base_sha": base,
+        "head_sha": head,
+        # No accepted commit means no sandbox has reported one: every tool
+        # call so far was a read, or none has finished. Empty, not absent, so
+        # a client can render it without branching.
+        "files": stat.get("files", []),
+        "files_changed": stat.get("files_changed", 0),
+        "additions": stat.get("additions", 0),
+        "deletions": stat.get("deletions", 0),
+        "files_truncated": stat.get("files_truncated", False),
+        "preview": row["diff_preview"] or "",
+        "preview_truncated": stat.get("preview_truncated", False),
+        "url": _compare_url(row["repo_url"], base, head),
+    }
+
+
+def _compare_url(repo_url: str, base: str | None, head: str | None) -> str | None:
+    """A link to the full patch on the forge hosting the repo.
+
+    Nothing here fetches anything; it is a string rewrite of the remote we
+    were given. None for a local bare repo or a host we have no URL shape
+    for, which a client should read as "the preview is all there is".
+    """
+    if not base or not head or base == head:
+        return None
+
+    # scp-style (git@host:owner/repo) and URL forms both reduce to a host and
+    # a path, and neither has a scheme worth keeping.
+    remainder = repo_url.split("://", 1)[-1].rsplit("@", 1)[-1]
+    host, separator, path = remainder.partition(":" if ":" in remainder.split("/")[0] else "/")
+    if not separator:
+        return None
+
+    template = config.COMPARE_URLS.get(host)
+    if template is None:
+        return None
+    return template.format(repo=path.strip("/").removesuffix(".git"), base=base, head=head)
+
+
 def get_events(
     session_id: str,
     after: int = 0,
     limit: int = 500,
     timeout: float = config.LONG_POLL_SECONDS,
-) -> list[dict]:
+) -> dict:
     """Long-poll the UI feed for events after a sequence number.
 
-    An empty list means the hold expired and the client should poll again with
-    the same cursor.
+    No events means the hold expired, and next_after comes back unchanged so
+    the caller can poll again with what it already has.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -77,11 +191,11 @@ def get_events(
                     (session_id, after, limit),
                 )
                 rows = cur.fetchall()
-        
+
         if rows:
-            return rows
+            return {"events": rows, "next_after": rows[-1]["seq"]}
         if time.monotonic() >= deadline:
-            return []
+            return {"events": [], "next_after": after}
         time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
@@ -106,9 +220,8 @@ def advance(session_id: str) -> None:
     try:
         reply = llm.complete(context)
     except Exception as exc:
-        # Recorded on the session rather than raised, so the handler that
-        # triggered this still returns and the client learns about it from
-        # the event feed.
+        # Recorded on the session, so the handler that triggered the advance 
+        # still returns and the client learns about it from the event feed.
         logger.exception("model call failed for session %s", session_id)
         _fail(session_id, f"model call failed: {exc}")
         return
@@ -130,25 +243,31 @@ def advance(session_id: str) -> None:
                 _emit(cur, session_id, "thinking", {"text": reply.reasoning})
 
             if not reply.tool_calls:
-                # The doc is inconsistent here: the loop pseudocode says
-                # awaiting_user, the Lifecycle section says complete. Following
-                # the pseudocode so the client can keep the conversation going.
-                _set_status(cur, session_id, "awaiting_user")
-                return
+                _set_status(cur, session_id, "idle")
 
-            for call in reply.tool_calls:
-                action_id = _insert_tool_call(cur, session_id, message_id, call)
-                _emit(
-                    cur,
-                    session_id,
-                    "tool_started",
-                    {
-                        "action_id": str(action_id),
-                        "name": call.name,
-                        "args": call.args,
-                    },
-                )
-            _set_status(cur, session_id, "executing")
+                # A user message which arrived while we were in the model call
+                # is not answered. Nothing is going to notice: add_user_message 
+                # saw a busy session and left the nudge to us to handle after 
+                # the call finishes.
+                unanswered = _last_message_role(cur, session_id) == "user"
+            else:
+                unanswered = False
+                for call in reply.tool_calls:
+                    action_id = _insert_tool_call(cur, session_id, message_id, call)
+                    _emit(
+                        cur,
+                        session_id,
+                        "tool_started",
+                        {
+                            "action_id": str(action_id),
+                            "name": call.name,
+                            "args": call.args,
+                        },
+                    )
+                _set_status(cur, session_id, "executing")
+
+    if unanswered:
+        advance(session_id)
 
 
 # ---------- ---------- ----------
@@ -156,7 +275,11 @@ def advance(session_id: str) -> None:
 # ---------- ---------- ----------
 
 class UnknownAction(Exception):
-    pass
+    """No such tool call on this session."""
+
+
+class ActionNotDispatched(Exception):
+    """The tool call exists but is not waiting on a result."""
 
 
 def claim_next_action(
@@ -173,15 +296,15 @@ def claim_next_action(
     while True:
         status, action = _claim_one_action(session_id, epoch)
         if action is not None:
-            return {"tool": action, "session_status": status}
+            return {"session_status": status, "tool": action}
 
         # Returned without waiting out the hold: there is nothing to wait for,
         # and the sooner the sandbox hears this the sooner it stops.
         if status in TERMINAL_STATUSES:
-            return {"tool": None, "session_status": status}
+            return {"session_status": status, "tool": None}
 
         if time.monotonic() >= deadline:
-            return {"tool": None, "session_status": status}
+            return {"session_status": status, "tool": None}
         time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
@@ -192,12 +315,23 @@ def record_action_result(
     result: str | None = None,
     exit_code: int | None = None,
     commit_sha: str | None = None,
-) -> bool:
-    """Accept a tool result from the current epoch.
+    base_sha: str | None = None,
+    diff_preview: str | None = None,
+    diff_stat: dict | None = None,
+    schedule: Callable[..., None] | None = None,
+) -> dict:
+    """Accept a tool result from the current epoch, and advance if it was the last.
 
-    Returns True when this was the last outstanding call of its batch, which
-    is the caller's cue to advance the loop. A non-zero exit code is still a
-    result: it goes back to the model as content rather than failing the call.
+    A non-zero exit code is still a result: it goes back to the model as
+    content rather than failing the call.
+
+    `schedule` is how the caller runs work after it has answered its own
+    client. 
+    
+    A model turn is unbounded — 82s has been observed — and cursord's
+    read timeout is 35s, so advancing inside the request makes it give up and
+    retry a result that was already accepted. Called inline when no scheduler
+    is offered, which is what direct callers and tests want.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -220,15 +354,51 @@ def record_action_result(
                 (result, exit_code, commit_sha, action_id, session_id, session_id),
             )
             row = cur.fetchone()
+                     
             if row is None:
+                # cursord retries a result until it gets an answer, and the
+                # model call this request triggers can easily outlast its
+                # client timeout. A second report of a result already
+                # accepted at this epoch is that retry, not an error.
+                if _already_accepted(cur, session_id, action_id, epoch):
+                    logger.info(
+                        "duplicate result for tool call %s on session %s, "
+                        "already accepted",
+                        action_id,
+                        session_id,
+                    )
+                    # Not advancing: the first report already did, and doing
+                    # it again would call the model a second time on the
+                    # same context.
+                    return {"batch_complete": False}
                 raise _rejected(cur, session_id, action_id, epoch)
 
+            # Both come from the sandbox, which is the only side holding a
+            # clone. base_sha is whatever the first sandbox cloned and never
+            # moves after that; COALESCE keeps a later epoch, which starts
+            # from a resume point rather than the base, from overwriting it.
+            cur.execute(
+                "UPDATE sessions SET base_sha = COALESCE(base_sha, %s), "
+                "updated_at = now() WHERE id = %s",
+                (base_sha, session_id),
+            )
+
             if commit_sha:
-                # Only a SHA from a live epoch may move the branch head.
+                # Only a SHA from a live epoch may move the branch head, and
+                # the summary moves with it in the same statement so it can
+                # never end up describing a commit other than the one here.
+                # Clamped again on this side: the cap is the column's, and a
+                # sandbox is not the thing that gets to decide it.
                 cur.execute(
-                    "UPDATE sessions SET last_accepted_sha = %s, updated_at = now() "
+                    "UPDATE sessions SET last_accepted_sha = %s, "
+                    "diff_preview = %s, diff_stat = %s, updated_at = now() "
                     "WHERE id = %s",
-                    (commit_sha, session_id),
+                    (
+                        commit_sha,
+                        (diff_preview or "")[: config.DIFF_PREVIEW_CHARS],
+                        json.dumps(diff_stat or {}),
+                        session_id,
+                    ),
                 )
 
             _emit(
@@ -252,7 +422,8 @@ def record_action_result(
                 (session_id, row["message_id"]),
             )
             if cur.fetchone()["open"]:
-                return False
+                # Parallel calls: only the last result of the batch advances.
+                return {"batch_complete": False}
 
             # Whole batch is in. Every result becomes its own tool message so
             # the context replays against the provider's tool_call ids.
@@ -270,7 +441,19 @@ def record_action_result(
                     content=_tool_message(call),
                     provider_call_id=call["provider_call_id"],
                 )
-            return True
+
+    # Outside the transaction: the rows the model is about to read are
+    # committed before anything goes looking for them.
+    _defer(schedule, advance, session_id)
+    return {"batch_complete": True}
+
+
+def _defer(schedule: Callable[..., None] | None, function, *args) -> None:
+    """Hand work to the caller's scheduler, or just do it here."""
+    if schedule is None:
+        function(*args)
+    else:
+        schedule(function, *args)
 
 
 def _next_seq(cur, session_id: str, column: str) -> int:
@@ -321,6 +504,15 @@ def _append_message(
         ),
     )
     return cur.fetchone()["id"]
+
+
+def _last_message_role(cur, session_id: str) -> str | None:
+    cur.execute(
+        "SELECT role FROM messages WHERE session_id = %s ORDER BY seq DESC LIMIT 1",
+        (session_id,),
+    )
+    row = cur.fetchone()
+    return row["role"] if row else None
 
 
 def _load_context(cur, session_id: str) -> list[dict]:
@@ -387,7 +579,7 @@ def _claim_thinking(session_id: str) -> bool:
             cur.execute(
                 "UPDATE sessions SET status = 'thinking', thinking_since = now(), "
                 "updated_at = now() "
-                "WHERE id = %s AND status IN ('awaiting_user', 'executing') "
+                "WHERE id = %s AND status IN ('idle', 'executing') "
                 "RETURNING id",
                 (session_id,),
             )
@@ -436,6 +628,10 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
 
     SKIP LOCKED means two sandboxes polling at the same moment take different
     rows instead of blocking on each other.
+
+    The RETURNING clause names the columns the way the sandbox reads them, so
+    the claimed row is the response body rather than something to copy into
+    one.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -460,7 +656,7 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
                         ORDER BY created_at
                         LIMIT 1
                           FOR UPDATE SKIP LOCKED)
-                RETURNING id, name, args, attempts, repeated
+                RETURNING id AS action_id, name, args, attempts AS attempt, repeated
                 """,
                 (epoch, session_id),
             )
@@ -468,17 +664,17 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
             if row is None:
                 return status, None
 
-            if row["attempts"] > config.MAX_TOOL_ATTEMPTS:
+            if row["attempt"] > config.MAX_TOOL_ATTEMPTS:
                 cur.execute(
                     "UPDATE tool_calls SET status = 'failed', completed_at = now() "
                     "WHERE id = %s",
-                    (row["id"],),
+                    (row["action_id"],),
                 )
                 _set_status(
                     cur,
                     session_id,
                     "failed",
-                    f"tool call {row['name']} failed after {row['attempts'] - 1} attempts",
+                    f"tool call {row['name']} failed after {row['attempt'] - 1} attempts",
                 )
                 # Reported as failed rather than as the status read at entry:
                 # this call is what made it terminal, and the sandbox should
@@ -486,6 +682,16 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
                 return "failed", None
 
             return status, row
+
+
+def _already_accepted(cur, session_id: str, action_id: str, epoch: int) -> bool:
+    """Is this a retry of a result that was already taken from this epoch?"""
+    cur.execute(
+        "SELECT 1 FROM tool_calls WHERE id = %s AND session_id = %s "
+        "AND status = 'done' AND epoch = %s",
+        (action_id, session_id, epoch),
+    )
+    return cur.fetchone() is not None
 
 
 def _rejected(cur, session_id: str, action_id: str, epoch: int) -> Exception:
@@ -496,12 +702,16 @@ def _rejected(cur, session_id: str, action_id: str, epoch: int) -> Exception:
     )
     row = cur.fetchone()
     if row is None:
+        # Genuinely nothing here: the only case that is a 404.
         return UnknownAction(f"no tool call {action_id} on session {session_id}")
     if row["epoch"] is not None and row["epoch"] != epoch:
         return StaleEpoch(
             f"tool call {action_id} went to epoch {row['epoch']}, not {epoch}"
         )
-    return UnknownAction(
+    # The call exists and belongs to this caller; it is just not in a state
+    # that can take a result. That is a conflict with the current state, not
+    # a missing resource.
+    return ActionNotDispatched(
         f"tool call {action_id} is {row['status']}, expected dispatched"
     )
 

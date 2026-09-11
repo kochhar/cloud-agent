@@ -84,6 +84,20 @@ MAX_TOOL_ATTEMPTS = int(_flag("MAX_TOOL_ATTEMPTS", "3"))
 # Results reach the model in full and the UI truncated.
 RESULT_PREVIEW_CHARS = int(_flag("RESULT_PREVIEW_CHARS", "2000"))
 
+# A patch is whatever the model wrote, so it has no bound worth storing in a
+# row that is rewritten on every commit. The sandbox sends a preview and a
+# per-file stat; this is the clamp applied to what arrives, independent of
+# the sandbox's own cap so a misbehaving one cannot grow the column.
+DIFF_PREVIEW_CHARS = int(_flag("DIFF_PREVIEW_CHARS", str(16 * 1024)))
+
+# Hosts whose web UI can render a two-dot compare, so the full patch has
+# somewhere to live that is not this database.
+COMPARE_URLS = {
+    "github.com": "https://github.com/{repo}/compare/{base}...{head}",
+    "gitlab.com": "https://gitlab.com/{repo}/-/compare/{base}...{head}",
+    "bitbucket.org": "https://bitbucket.org/{repo}/branches/compare/{head}..{base}",
+}
+
 
 # ---------------------------------------------------------------------------
 # sandbox: which runtime
@@ -93,11 +107,9 @@ RESULT_PREVIEW_CHARS = int(_flag("RESULT_PREVIEW_CHARS", "2000"))
 #   docker   one container per epoch, from SANDBOX_IMAGE. The real thing.
 #   process  a plain subprocess on this machine. Development only, and
 #            emphatically not a sandbox: see sandbox._start_process.
-SANDBOX_RUNTIME = _flag("SANDBOX_RUNTIME", "docker")
+SANDBOX_RUNTIME = _flag("SANDBOX_RUNTIME", "process")
 
 SPAWN_TIMEOUT_SECONDS = float(_flag("SANDBOX_SPAWN_TIMEOUT", "60"))
-
-GIT_TIMEOUT_SECONDS = float(_flag("SANDBOX_GIT_TIMEOUT", "30"))
 
 
 # ---------------------------------------------------------------------------

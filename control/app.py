@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import anyio.to_thread
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -65,15 +65,33 @@ def _unknown_action(request: Request, exc: sessions.UnknownAction) -> JSONRespon
     return _problem(404, str(exc))
 
 
+@app.exception_handler(sessions.ActionNotDispatched)
+def _not_dispatched(request: Request, exc: sessions.ActionNotDispatched) -> JSONResponse:
+    # The call exists, so this is a conflict with its state, not a 404.
+    return _problem(409, str(exc))
+
+
 @app.exception_handler(sessions.StaleEpoch)
 def _stale_epoch(request: Request, exc: sessions.StaleEpoch) -> JSONResponse:
     # 409 is the sandbox's cue to stop working and exit.
     return _problem(409, str(exc))
 
 
+@app.exception_handler(sessions.SessionFinished)
+def _session_finished(request: Request, exc: sessions.SessionFinished) -> JSONResponse:
+    return _problem(409, str(exc))
+
+
 @app.exception_handler(sandbox.SpawnRefused)
 def _spawn_refused(request: Request, exc: sandbox.SpawnRefused) -> JSONResponse:
     return _problem(409, str(exc))
+
+
+@app.exception_handler(sandbox.SandboxNotRegistered)
+def _sandbox_unknown(
+    request: Request, exc: sandbox.SandboxNotRegistered
+) -> JSONResponse:
+    return _problem(404, str(exc))
 
 
 def _not_built(what: str) -> HTTPException:
@@ -103,10 +121,20 @@ class ActionResultRequest(BaseModel):
     result: Optional[str] = None
     exit_code: Optional[int] = None
     commit_sha: Optional[str] = None
+    # Git belongs to the data plane, so what the control plane knows about
+    # the diff is what the sandbox tells it. Bounded on both sides: a preview
+    # rather than the patch, and a stat rather than the file contents.
+    base_sha: Optional[str] = None
+    diff_preview: Optional[str] = None
+    diff_stat: Optional[dict] = None
 
 
 class HeartbeatRequest(BaseModel):
     epoch: int
+    # A sandbox shutting down says so on its way out, so the reaper can tell
+    # a deliberate exit from a container that simply stopped answering.
+    exiting: bool = False
+    reason: Optional[str] = None
 
 
 
@@ -115,9 +143,7 @@ class HeartbeatRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
-    with db.pool.connection() as conn:
-        row = conn.execute("SELECT version(), current_database()").fetchone()
-    return {"ok": True, "database": row["current_database"], "version": row["version"]}
+    return {"ok": True, **db.health()}
 
 
 @app.post("/internal/reap")
@@ -133,14 +159,7 @@ def reap() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.post("/sessions", status_code=201)
 def create_session(body: CreateSessionRequest) -> Dict[str, Any]:
-    # create_session spawns the sandbox and takes the first turn itself, so
-    # there is nothing to kick off here.
-    created = sessions.create_session(body.repo_url, body.prompt)
-    return {
-        "ok": True,
-        "session_id": str(created["session_id"]),
-        "branch": created["branch"],
-    }
+    return {"ok": True, **sessions.create_session(body.repo_url, body.prompt)}
 
 
 @app.get("/sessions/{session_id}")
@@ -150,7 +169,8 @@ def get_session(session_id: str) -> Dict[str, Any]:
 
 @app.post("/sessions/{session_id}/messages", status_code=202)
 def create_message(session_id: str, body: CreateMessageRequest) -> Dict[str, Any]:
-    raise _not_built("sessions.add_user_message")
+    """Add a user message. Advances the loop if nothing else is running."""
+    return {"ok": True, **sessions.add_user_message(session_id, body.content)}
 
 
 @app.get("/sessions/{session_id}/events")
@@ -160,12 +180,7 @@ def get_events(
     limit: int = Query(500, ge=1, le=1000),
 ) -> Dict[str, Any]:
     """Long-poll the UI feed. An empty list means poll again with the same cursor."""
-    events = sessions.get_events(session_id, after=after, limit=limit)
-    return {
-        "ok": True,
-        "events": events,
-        "next_after": events[-1]["seq"] if events else after,
-    }
+    return {"ok": True, **sessions.get_events(session_id, after=after, limit=limit)}
 
 
 @app.post("/sessions/{session_id}/cancel")
@@ -175,7 +190,8 @@ def cancel_session(session_id: str) -> Dict[str, Any]:
 
 @app.get("/sessions/{session_id}/diff")
 def get_diff(session_id: str) -> Dict[str, Any]:
-    raise _not_built("sessions.get_diff")
+    """The branch against its base, as the control plane accepted it."""
+    return {"ok": True, **sessions.get_diff(session_id)}
 
 
 
@@ -186,8 +202,7 @@ def get_diff(session_id: str) -> Dict[str, Any]:
 @app.post("/sandbox/{session_id}/register")
 def register_sandbox(session_id: str, body: RegisterRequest) -> Dict[str, Any]:
     """Sandbox announces itself with its epoch."""
-    registration = sandbox.register(session_id, body.epoch, body.container_id)
-    return dict({"ok": True}, **registration)
+    return {"ok": True, **sandbox.register(session_id, body.epoch, body.container_id)}
 
 
 @app.get("/sandbox/{session_id}/next-action")
@@ -197,42 +212,42 @@ def get_next_action(session_id: str, epoch: int = Query(..., ge=0)) -> Dict[str,
     A null tool means the hold expired with nothing pending, unless
     session_status is terminal, which means the sandbox should exit.
     """
-    claim = sessions.claim_next_action(session_id, epoch)
-    action = claim["tool"]
-    return {
-        "ok": True,
-        "session_status": claim["session_status"],
-        "tool": None if action is None else {
-            "action_id": str(action["id"]),
-            "name": action["name"],
-            "args": action["args"],
-            "attempt": action["attempts"],
-            "repeated": action["repeated"],
-        },
-    }
+    return {"ok": True, **sessions.claim_next_action(session_id, epoch)}
 
 
 @app.post("/sandbox/{session_id}/actions/{action_id}/result")
 def save_action_result(
-    session_id: str, action_id: str, body: ActionResultRequest
+    session_id: str,
+    action_id: str,
+    body: ActionResultRequest,
+    background: BackgroundTasks,
 ) -> Dict[str, Any]:
-    batch_complete = sessions.record_action_result(
-        session_id,
-        action_id,
-        epoch=body.epoch,
-        result=body.result,
-        exit_code=body.exit_code,
-        commit_sha=body.commit_sha,
-    )
-    # Parallel calls: only the last result of the batch advances the loop.
-    if batch_complete:
-        sessions.advance(session_id)
-    return {"ok": True, "batch_complete": batch_complete}
+    return {
+        "ok": True,
+        **sessions.record_action_result(
+            session_id,
+            action_id,
+            epoch=body.epoch,
+            result=body.result,
+            exit_code=body.exit_code,
+            commit_sha=body.commit_sha,
+            base_sha=body.base_sha,
+            diff_preview=body.diff_preview,
+            diff_stat=body.diff_stat,
+            # Anything sessions wants to run once this response is sent.
+            schedule=background.add_task,
+        ),
+    }
 
 
 @app.post("/sandbox/{session_id}/heartbeat")
 def heartbeat(session_id: str, body: HeartbeatRequest) -> Dict[str, Any]:
-    raise _not_built("sandbox.heartbeat")
+    return {
+        "ok": True,
+        **sandbox.heartbeat(
+            session_id, body.epoch, exiting=body.exiting, reason=body.reason
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

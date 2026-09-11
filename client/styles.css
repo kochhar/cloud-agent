@@ -142,10 +142,16 @@ code { font-family: var(--mono); font-size: 12px; }
 /* ---------- sessions ---------- */
 .sessions { list-style: none; margin: 0; padding: 0; }
 
-.sessions li { margin-bottom: 4px; }
+.sessions li {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 4px;
+}
 
-.sessions button {
-  width: 100%;
+.sessions .pick {
+  flex: 1;
+  min-width: 0;
   text-align: left;
   background: transparent;
   border: 1px solid transparent;
@@ -159,8 +165,21 @@ code { font-family: var(--mono); font-size: 12px; }
   white-space: nowrap;
 }
 
-.sessions button:hover { background: var(--panel); }
-.sessions li.current button { border-color: var(--line); color: var(--text); }
+.sessions .pick:hover { background: var(--panel); }
+.sessions li.current .pick { border-color: var(--line); color: var(--text); }
+
+.sessions .drop {
+  flex: none;
+  padding: 3px 7px;
+  background: transparent;
+  color: var(--dim);
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.35;
+}
+
+.sessions li:hover .drop, .sessions .drop:focus-visible { opacity: 1; }
+.sessions .drop:hover { color: var(--bad); }
 
 /* ---------- feed ---------- */
 .feed-pane { display: flex; flex-direction: column; min-height: 0; }
@@ -205,6 +224,7 @@ code { font-family: var(--mono); font-size: 12px; }
 .feed .body { white-space: pre-wrap; word-break: break-word; }
 
 .feed .agent .body { color: #fff; font-family: inherit; font-size: 14px; }
+.feed .you .body { color: var(--accent); font-family: inherit; font-size: 14px; }
 .feed .thinking .body { color: var(--dim); font-style: italic; }
 .feed .bad .body, .feed .bad .tag { color: var(--bad); }
 .feed .good { color: var(--good); }
@@ -219,6 +239,40 @@ code { font-family: var(--mono); font-size: 12px; }
 }
 
 .feed .placeholder { color: var(--dim); display: block; }
+
+/* ---------- diff ---------- */
+.feed .diff-stat { color: var(--text); }
+
+.feed .diff-files {
+  display: grid;
+  /* path takes the slack; the two counts stay in their own columns so the
+     eye can run down them. Capped, or on a wide window the counts end up an
+     inch of empty space away from the file they belong to. */
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  max-width: 560px;
+  gap: 0 14px;
+  margin-top: 5px;
+  font-size: 12px;
+}
+
+.feed .diff-files .path { color: var(--dim); overflow-wrap: anywhere; }
+.feed .diff-files .add { color: var(--good); text-align: right; }
+.feed .diff-files .del { color: var(--bad); text-align: right; }
+
+.feed .diff-files .binary {
+  grid-column: 2 / span 2;
+  text-align: right;
+  color: var(--warn);
+}
+
+.feed .diff-note {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.feed a { color: var(--accent); }
+.feed a:hover { text-decoration: none; }
 
 /* ---------- message box ---------- */
 .message-form {

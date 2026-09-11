@@ -26,6 +26,17 @@ class SpawnRefused(Exception):
     """The session is not in a state that can take a new sandbox."""
 
 
+class SandboxNotRegistered(Exception):
+    """A heartbeat arrived for an epoch that has no sandbox row."""
+
+
+# Reasons a sandbox can stop with nothing wrong. Anything else it reports on
+# the way out is a sandbox that stopped early, which is the reaper's problem
+# even though this one was polite enough to say so. The sandbox reports what
+# happened; deciding whether that needs a replacement is not its call.
+CLEAN_EXITS = frozenset({"session_finished"})
+
+
 def spawn(session_id: str) -> dict:
     """Open a new epoch for the session and start a container against it.
 
@@ -38,7 +49,7 @@ def spawn(session_id: str) -> dict:
             # get different epochs rather than the same one.
             cur.execute(
                 "UPDATE sessions SET current_epoch = current_epoch + 1, updated_at = now() "
-                "WHERE id = %s AND status NOT IN ('completed','failed','cancelled') "
+                "WHERE id = %s AND status NOT IN ('failed','cancelled') "
                 "RETURNING current_epoch, repo_url, branch",
                 (session_id,),
             )
@@ -115,16 +126,6 @@ def register(session_id: str, epoch: int, container_id: str | None = None) -> di
             )
             session = cur.fetchone()
 
-            # Resolved once, on the first registration, and left alone after
-            # that: the diff has to sit against where the work started, not
-            # against wherever the remote has moved to since.
-            base_sha = session["base_sha"] or _resolve_base_sha(session["repo_url"])
-            if base_sha and base_sha != session["base_sha"]:
-                cur.execute(
-                    "UPDATE sessions SET base_sha = %s, updated_at = now() WHERE id = %s",
-                    (base_sha, session_id),
-                )
-
             cur.execute(
                 """
                 INSERT INTO sandboxes
@@ -144,7 +145,12 @@ def register(session_id: str, epoch: int, container_id: str | None = None) -> di
     return {
         "repo_url": session["repo_url"],
         "branch": session["branch"],
-        "base_sha": base_sha,
+        # Null on a first spawn. Nothing here resolves it: the control plane
+        # runs no git at all, so the base is whatever the sandbox finds when
+        # it clones, and it comes back with the sandbox's first result. A
+        # rebuild reads it from here so its diff still starts where the work
+        # did rather than at the point it resumed from.
+        "base_sha": session["base_sha"],
         # A replacement resumes from the last SHA the control plane accepted,
         # not from whatever the dead sandbox managed to push before it went.
         "resume_sha": session["last_accepted_sha"],
@@ -152,33 +158,82 @@ def register(session_id: str, epoch: int, container_id: str | None = None) -> di
     }
 
 
-def _resolve_base_sha(repo_url: str) -> Optional[str]:
-    """The head the work starts from, so there is something to diff against."""
-    if os.path.isdir(repo_url):
-        command = ["git", "-C", repo_url, "rev-parse", "HEAD"]
+def heartbeat(
+    session_id: str,
+    epoch: int,
+    exiting: bool = False,
+    reason: str | None = None,
+) -> dict:
+    """Liveness, and the one place a sandbox announces its own shutdown.
+
+    A stale epoch raises, which is what tells a zombie to stop: it is the
+    only failure a sandbox is meant to die on, so nothing else in here may
+    surface as a 409.
+
+    Ordinary beats do not write to the event log. At one every three seconds
+    they would bury the transcript in noise that says nothing happened; the
+    timestamp on the row is the whole record. An exit is different, because
+    it happens once and explains why the sandbox stopped.
+    """
+    if exiting:
+        status = "exited" if reason in CLEAN_EXITS else "dead"
     else:
-        command = ["git", "ls-remote", repo_url, "HEAD"]
+        status = "ready"
 
-    try:
-        finished = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=config.GIT_TIMEOUT_SECONDS,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        # Not fatal: registration still succeeds, but the diff will be empty
-        # until a base is known.
-        logger.warning(
-            "could not resolve base sha for %s: %s",
-            repo_url,
-            (getattr(exc, "stderr", "") or "").strip() or exc,
-        )
-        return None
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            sessions._require_current_epoch(cur, session_id, epoch)
 
-    fields = finished.stdout.split()
-    return fields[0] if fields else None
+            cur.execute(
+                """
+                UPDATE sandboxes
+                   SET last_heartbeat_at = now(),
+                       status = CASE WHEN status = 'exited'
+                                     THEN 'exited' ELSE %s END
+                 WHERE session_id = %s AND epoch = %s
+                RETURNING status
+                """,
+                # 'exited' is final. A beat still in flight when the container
+                # said goodbye must not land it back in the reaper's index,
+                # where a clean shutdown reads as a crash ten seconds later.
+                #
+                # 'dead' is not final. A beat from a sandbox the reaper gave
+                # up on is proof the reaper was wrong, and the epoch check
+                # above means no replacement has taken over yet.
+                (status, session_id, epoch),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Not a 409: on this endpoint that means "you are stale, stop
+                # working", and a sandbox that never registered would take
+                # itself down for a reason that has nothing to do with it.
+                raise SandboxNotRegistered(
+                    f"session {session_id} has no sandbox at epoch {epoch}; "
+                    "register before sending heartbeats"
+                )
+
+            if exiting:
+                sessions._emit(
+                    cur,
+                    session_id,
+                    "sandbox_exited",
+                    {
+                        "epoch": epoch,
+                        "reason": reason or "unspecified",
+                        "status": row["status"],
+                    },
+                )
+
+    if exiting:
+        logger.info(
+            "sandbox for session %s epoch %s exited (%s), marked %s",
+            session_id,
+            epoch,
+            reason or "unspecified",
+            row["status"],
+        )
+
+    return {"epoch": epoch, "status": row["status"]}
 
 
 def _ssh_arguments() -> list:

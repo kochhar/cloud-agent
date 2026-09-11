@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from . import config
@@ -81,8 +82,21 @@ async def reset_to(sha: str) -> None:
     await git("reset", "--hard", sha)
 
 
-async def checkpoint(message: str) -> Optional[str]:
-    """Commit and push if the tool call changed anything. Returns the SHA.
+@dataclass(frozen=True)
+class Checkpoint:
+    """A pushed commit and everything the control plane learns about it.
+
+    The patch itself is not in here. `preview` is the first few pages of it
+    and `stat` is the per-file counts; the whole thing stays in the repo.
+    """
+
+    sha: str
+    preview: str
+    stat: dict
+
+
+async def checkpoint(message: str, base: str) -> Optional[Checkpoint]:
+    """Commit and push if the tool call changed anything.
 
     None means the tree was clean, which is the common case: reads, listings,
     and most commands touch nothing. No commit, no SHA, nothing to reconcile.
@@ -106,7 +120,55 @@ async def checkpoint(message: str) -> Optional[str]:
     # plane's last_accepted_sha is the authority on the branch, not the tip.
     await git("push", "--force", "origin", f"HEAD:refs/heads/{config.BRANCH}")
     logger.info("checkpoint %s", sha[:12])
-    return sha
+
+    # Against the base, not against the previous commit: the control plane
+    # replaces what it holds each time, so every checkpoint has to describe
+    # the whole session's work rather than the increment.
+    preview, stat = await summarise(base, sha)
+    return Checkpoint(sha=sha, preview=preview, stat=stat)
+
+
+async def summarise(base: str, head: str) -> tuple[str, dict]:
+    """The bounded description of base..head that the control plane stores."""
+    patch = await git("diff", f"{base}..{head}")
+    preview = patch[: config.DIFF_PREVIEW_CHARS]
+
+    files = []
+    changed = additions = deletions = 0
+    for line in (await git("diff", "--numstat", f"{base}..{head}")).splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) != 3:
+            continue
+        # Binary files report "-" for both counts, and adding that to a total
+        # is how a stat line ends up saying NaN in a browser.
+        binary = not fields[0].isdigit()
+        added = 0 if binary else int(fields[0])
+        removed = 0 if binary else int(fields[1])
+
+        # Totalled over every file, including ones past the list cap, so a
+        # truncated list still adds up to the truth.
+        changed += 1
+        additions += added
+        deletions += removed
+
+        if len(files) < config.DIFF_MAX_FILES:
+            files.append(
+                {
+                    "path": fields[2],
+                    "additions": added,
+                    "deletions": removed,
+                    "binary": binary,
+                }
+            )
+
+    return preview, {
+        "files": files,
+        "files_changed": changed,
+        "additions": additions,
+        "deletions": deletions,
+        "files_truncated": changed > len(files),
+        "preview_truncated": len(patch) > len(preview),
+    }
 
 
 async def _remote_has(branch: str) -> bool:

@@ -62,6 +62,21 @@ POLL_READ_TIMEOUT = POLL_HOLD_SECONDS + 10
 RETRY_BASE_SECONDS = 0.5
 RETRY_MAX_SECONDS = 5.0
 
+# How long the session may sit idle before this container gives up its seat.
+# An idle session has finished its turn and is waiting on a person, which is
+# an unbounded wait, and a container held open for it is a container the
+# reaper will eventually mistake for a live one.
+#
+# The cost of leaving is a fresh clone when the conversation resumes; the
+# cost of staying is a machine's worth of memory per abandoned tab. Five
+# minutes is long enough that a reply typed straight back is still answered
+# by this container, and short enough that a tab left open overnight is not.
+#
+# It lives here rather than on the control plane because the container is
+# what it spends: the control plane would be deciding how long someone
+# else's process should live.
+IDLE_EXIT_SECONDS = float(os.environ.get("IDLE_EXIT_SECONDS", "300"))
+
 # ---------------------------------------------------------------------------
 # tool limits
 # ---------------------------------------------------------------------------
@@ -88,3 +103,11 @@ GIT_AUTHOR_EMAIL = "cursord@local"
 FORCE_ADD_PATHS = tuple(
     p for p in os.environ.get("FORCE_ADD_PATHS", ".env").split(",") if p
 )
+
+# The control plane keeps no clone, so what it knows about the diff is what we
+# send it. A whole patch has no bound worth relying on and would sit in a
+# column that is rewritten on every commit, so it gets a preview and a
+# per-file stat instead; the full patch stays in the repository, which is
+# where the deliverable actually lives.
+DIFF_PREVIEW_CHARS = int(os.environ.get("DIFF_PREVIEW_CHARS", str(16 * 1024)))
+DIFF_MAX_FILES = int(os.environ.get("DIFF_MAX_FILES", "200"))
