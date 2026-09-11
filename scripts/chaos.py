@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Chaos harness.
 
-Starts N sessions against the control plane, kills live sandboxes at random
-while they work, and reports what survived.
+Starts N sessions against the control plane, kills live sandboxes and
+control-plane instances at random while they work, and reports what survived.
 
-The point is to turn "the architecture recovers from sandbox death" into a
-number. Run it once with --no-chaos for a baseline, once with chaos, and
-compare completion rates.
+The point is to turn "the architecture recovers from death" into a number.
+Run it once with --no-chaos for a baseline, once with chaos, and compare
+completion rates.
 
     python scripts/chaos.py --sessions 8 --kill-every 20
+    python scripts/chaos.py --sessions 8 --kill-every 45 --kill-control-every 60
     python scripts/chaos.py --sessions 8 --no-chaos          # baseline
 
-Reads the sandboxes table directly to find things to kill, rather than
-scraping `docker ps`, because the control plane starts containers with no
-labels and the process runtime has no containers at all. The DB knows about
-both.
+Sandbox victims come from the sandboxes table, not `docker ps`, because the
+control plane starts containers with no labels and the process runtime has
+no containers at all. Control-plane victims are the uvicorn processes
+listening on the cluster ports behind nginx. The launcher restarts those;
+nginx itself is left alone.
 """
 
 from __future__ import annotations
@@ -37,6 +39,10 @@ from psycopg.rows import dict_row
 CONTROL_URL = os.environ.get("CONTROL_URL", "http://127.0.0.1:8000")
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres@127.0.0.1:5432/project1"
+)
+CONTROL_PORTS = tuple(
+    int(p) for p in os.environ.get("CONTROL_PORTS", "8101,8102,8103").split(",")
+    if p.strip()
 )
 
 
@@ -83,6 +89,9 @@ class Run:
 
 runs: dict[str, Run] = {}
 pending: list[Run] = []  # sessions created but not yet in runs, for the killer
+# Client-visible failures talking to the control plane (502s, dropped
+# connections). A restart is not a session failure; these are the blips.
+http_errors = 0
 
 
 # ---------------------------------------------------------------------------
@@ -91,18 +100,30 @@ pending: list[Run] = []  # sessions created but not yet in runs, for the killer
 async def drive(client: httpx.AsyncClient, repo_url: str, prompt: str,
                 timeout: float) -> Run:
     """Create a session and follow its event feed until it settles."""
-    response = await client.post(
-        "/sessions", json={"repo_url": repo_url, "prompt": prompt}, timeout=60.0
-    )
-    response.raise_for_status()
-    session_id = response.json()["session_id"]
+    global http_errors
+    session_id = None
+    deadline = time.monotonic() + timeout
+    while session_id is None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("could not create a session before the deadline")
+        try:
+            response = await client.post(
+                "/sessions", json={"repo_url": repo_url, "prompt": prompt},
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            session_id = response.json()["session_id"]
+        except httpx.HTTPError as exc:
+            # A control plane restart is not a session failure.
+            http_errors += 1
+            print(f"  create error: {exc}")
+            await asyncio.sleep(1.0)
 
     run = Run(session_id=session_id, started=time.monotonic())
     runs[session_id] = run
     print(f"  started {session_id[:8]}  {follow_url(session_id)}")
 
     after = 0
-    deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
         try:
@@ -115,6 +136,7 @@ async def drive(client: httpx.AsyncClient, repo_url: str, prompt: str,
             feed.raise_for_status()
         except httpx.HTTPError as exc:
             # A control plane restart is not a session failure.
+            http_errors += 1
             print(f"  {session_id[:8]} feed error: {exc}")
             await asyncio.sleep(1.0)
             continue
@@ -222,6 +244,89 @@ async def chaos_loop(interval: float, stop: asyncio.Event) -> int:
     return killed
 
 
+def _pid_on_port(port: int) -> int | None:
+    """The process listening on `port`, or None if nothing is there."""
+    finished = subprocess.run(
+        ["lsof", "-nP", "-iTCP:%s" % port, "-sTCP:LISTEN", "-t"],
+        capture_output=True, text=True,
+    )
+    for token in finished.stdout.split():
+        try:
+            return int(token)
+        except ValueError:
+            continue
+    needle = "--port %s" % port
+    listed = subprocess.run(
+        ["ps", "-axo", "pid=,args="], capture_output=True, text=True
+    )
+    for line in listed.stdout.splitlines():
+        line = line.strip()
+        if "uvicorn" in line and "app:app" in line and needle in line:
+            return int(line.split(None, 1)[0])
+    return None
+
+
+def live_control_instances() -> list[dict]:
+    """Control-plane uvicorn processes currently accepting on the cluster ports.
+
+    Nginx is not in this list. Killing the proxy would take the whole
+    deployment down; the interesting case is one instance behind it dying
+    while the others keep serving.
+    """
+    found = []
+    for port in CONTROL_PORTS:
+        pid = _pid_on_port(port)
+        if pid is not None:
+            found.append({"port": port, "pid": pid})
+    return found
+
+
+def kill_control(pid: int) -> bool:
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+async def control_chaos_loop(interval: float, stop: asyncio.Event) -> int:
+    """Kill one live control-plane instance every `interval` seconds.
+
+    Leaves at least one instance up so the kill is a reduced-capacity event
+    rather than a total outage. The launcher is what brings the victim back.
+    """
+    killed = 0
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return killed
+        except asyncio.TimeoutError:
+            pass
+
+        instances = await asyncio.to_thread(live_control_instances)
+        if len(instances) <= 1:
+            if instances:
+                print(
+                    "  skip control kill: only :%s is up"
+                    % instances[0]["port"]
+                )
+            else:
+                print("  skip control kill: no control instances listening")
+            continue
+
+        victim = random.choice(instances)
+        if await asyncio.to_thread(kill_control, victim["pid"]):
+            killed += 1
+            print(
+                "  KILLED control pid %s on :%s (%s still up)"
+                % (victim["pid"], victim["port"], len(instances) - 1)
+            )
+        else:
+            print("  control kill failed for pid %s" % victim["pid"])
+
+    return killed
+
+
 # ---------------------------------------------------------------------------
 # the report
 # ---------------------------------------------------------------------------
@@ -256,7 +361,7 @@ SELECT
 """
 
 
-def report(finished: list[Run], killed: int) -> None:
+def report(finished: list[Run], killed: int, control_killed: int = 0) -> None:
     ids = [run.session_id for run in finished]
 
     with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
@@ -281,6 +386,8 @@ def report(finished: list[Run], killed: int) -> None:
 
     print()
     line("sandboxes killed", killed)
+    line("control instances killed", control_killed)
+    line("client http errors", http_errors)
     line("sessions hit", len(hit))
     if hit:
         line("recovered", f"{len(recovered)} ({_pct(len(recovered), len(hit))})")
@@ -334,7 +441,10 @@ async def main() -> int:
                         "./run_tests.sh. Do not change any behaviour.")
     parser.add_argument("--sessions", type=int, default=5)
     parser.add_argument("--kill-every", type=float, default=25.0,
-                        help="seconds between kills")
+                        help="seconds between sandbox kills; 0 disables")
+    parser.add_argument("--kill-control-every", type=float, default=0.0,
+                        help="seconds between control-plane instance kills; "
+                             "0 disables")
     parser.add_argument("--no-chaos", action="store_true",
                         help="run the load without killing anything")
     parser.add_argument("--timeout", type=float, default=600.0,
@@ -346,13 +456,24 @@ async def main() -> int:
     if not args.repo_url:
         parser.error("--repo-url is required (or set CHAOS_REPO_URL)")
 
-    mode = "baseline" if args.no_chaos else f"chaos every {args.kill_every:.0f}s"
+    kinds = []
+    if not args.no_chaos and args.kill_every > 0:
+        kinds.append("sandboxes every %.0fs" % args.kill_every)
+    if not args.no_chaos and args.kill_control_every > 0:
+        kinds.append("control every %.0fs" % args.kill_control_every)
+    mode = "baseline" if not kinds else "chaos " + ", ".join(kinds)
     print(f"\n{args.sessions} sessions against {args.repo_url} — {mode}\n")
 
     stop = asyncio.Event()
     killer = (
-        None if args.no_chaos
+        None if args.no_chaos or args.kill_every <= 0
         else asyncio.create_task(chaos_loop(args.kill_every, stop))
+    )
+    control_killer = (
+        None if args.no_chaos or args.kill_control_every <= 0
+        else asyncio.create_task(
+            control_chaos_loop(args.kill_control_every, stop)
+        )
     )
 
     async with httpx.AsyncClient(base_url=CONTROL_URL) as client:
@@ -367,12 +488,13 @@ async def main() -> int:
 
     stop.set()
     killed = await killer if killer else 0
+    control_killed = await control_killer if control_killer else 0
 
     finished = [r for r in results if isinstance(r, Run)]
     for failure in (r for r in results if not isinstance(r, Run)):
         print(f"  harness error: {failure}")
 
-    report(finished, killed)
+    report(finished, killed, control_killed)
 
     # Non-zero if anything was left stranded, so this can gate a commit.
     return 0 if all(r.status == "idle" for r in finished) else 1
