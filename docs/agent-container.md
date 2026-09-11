@@ -40,9 +40,9 @@ and the SHA to resume from. Retried on connection failure, because the
 container regularly wins the race against the instance that spawned it.
 
 **Heartbeat starts before the clone.** A large repo can take longer than the
-ten-second death threshold. A sandbox reaped while still cloning would never
-execute anything, and would be replaced by another sandbox that also gets
-reaped while cloning.
+death threshold. A sandbox reaped while still cloning would never execute
+anything, and would be replaced by another sandbox that also gets reaped
+while cloning.
 
 **Clone.** Identical on a first spawn and on a rebuild — same code path, a
 different starting SHA. If the branch exists on the remote we check it out; if

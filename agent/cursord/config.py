@@ -47,10 +47,18 @@ WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/repo"))
 # ---------------------------------------------------------------------------
 # timings
 # ---------------------------------------------------------------------------
-# Heartbeats have to be well inside the control plane's death threshold (10s
-# in this build) because the reaper spawns a replacement the moment it trips.
-# Three seconds gives us three misses before anyone panics.
-HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "3"))
+# The interval and the control plane's death threshold are one decision made
+# in two files: the reaper spawns a replacement the moment the threshold
+# trips, so the threshold has to leave room for beats to go missing without
+# the sandbox being wrong. Three misses is the rule of thumb, which puts the
+# threshold at 90s for the 30s below. Raising this without raising that is
+# how every live sandbox gets replaced while it is working.
+#
+# What the interval buys is how long a genuinely dead sandbox holds its
+# session: a lower number finds the corpse sooner and costs a request per
+# container per tick. 30s is the slower end of that trade, appropriate while
+# the reaper is not built and nothing reads last_heartbeat_at yet.
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 
 # How long the control plane holds the next-action poll open. cursord's own
 # read timeout has to exceed it or every poll looks like a network failure.

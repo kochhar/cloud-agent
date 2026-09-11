@@ -203,7 +203,7 @@ def heartbeat(
                 """,
                 # 'exited' is final. A beat still in flight when the container
                 # said goodbye must not land it back in the reaper's index,
-                # where a clean shutdown reads as a crash ten seconds later.
+                # where a clean shutdown reads as a crash a threshold later.
                 #
                 # 'dead' is not final. A beat from a sandbox the reaper gave
                 # up on is proof the reaper was wrong, and the epoch check
