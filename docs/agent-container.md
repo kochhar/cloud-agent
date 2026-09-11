@@ -188,13 +188,17 @@ client should show the death, the replacement, and then the completed work.
 These are contract gaps, not implementation details. Each one needs a decision
 on the control-plane side before the container is finished.
 
-1. **A finished session never stops its container.** `next-action` returns a
-   null tool both for "nothing pending yet" and for "this session is over", so
-   a completed session leaves a container long-polling forever. The sketch
-   assumes the response also carries `session_status` and exits on a terminal
-   one. The alternative is for `cancel` and completion to `docker kill`, which
-   works but leaves the container's exit depending on the control plane being
-   up at the right moment.
+1. ~~**A finished session never stops its container.**~~ *Settled.*
+   `next-action` carries `session_status` alongside the tool, so a null tool
+   is no longer ambiguous. `failed` and `cancelled` stop the container at
+   once. `idle` does not, because the session can still be resumed by a user
+   message: cursord starts a clock on the first idle answer, resets it on any
+   work, and leaves once the session has been idle for `IDLE_EXIT_SECONDS`,
+   five minutes by default. On the way out it posts a heartbeat with
+   `exiting` set, so the sandbox row is retired deliberately rather than by
+   going stale. The rejected alternative was `docker kill` from the control
+   plane, which makes a container's exit depend on the control plane being up
+   at the right moment.
 
 2. **Who resolves `base_sha`?** The schema comments say "set at first
    register", but register is documented as *returning* the base SHA, and on a

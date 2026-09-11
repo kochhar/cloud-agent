@@ -122,8 +122,8 @@ def advance(sid):
     emit(sid, "text", text)
     emit(sid, "thinking", thinking)
     if not tools:
-        set_status(sid, "awaiting_user")
-        emit(sid, "status", "awaiting_user")
+        set_status(sid, "idle")
+        emit(sid, "status", "idle")
     else:
         insert_pending_tool_calls(sid, tools)
         for t in tools:
@@ -155,7 +155,9 @@ The client has to see what the agent is doing as it happens. With no process hol
 
 ### Event types
 
-`thinking`, `text`, `tool_started`, `tool_finished`, `status`, and the sandbox lifecycle set: `sandbox_spawning`, `sandbox_ready`, `sandbox_died`, `sandbox_replaced`.
+`thinking`, `text`, `tool_started`, `tool_finished`, `status`, and the sandbox lifecycle set: `sandbox_spawning`, `sandbox_ready`, `sandbox_died`, `sandbox_replaced`, `sandbox_exited`.
+
+`sandbox_exited` is the ordinary end of a container's life and is kept apart from `sandbox_died` on purpose. A feed that reported a death every time a turn ended would train the reader to ignore the word.
 
 We should be able to kill a container mid-task and watch the client report the death, the replacement, and then the completed work shows how this architecture works.
 
@@ -173,7 +175,15 @@ Text and thinking are written as whole events when the LLM call returns.
 
 **Run.** Tools available to the model: read file, write file, list files, run command. The write path ends in a commit and a push when the tree is dirty.
 
-**Finish.** The model returns a response with no tool calls. The session is marked complete and the diff is read from the bare repo.
+**Finish.** The model returns a response with no tool calls. The session is marked `idle` and the diff is read from the bare repo.
+
+`idle` is a resting state, not a closed one. The turn is over and the next move belongs to the user, which is a wait with no upper bound, so the sandbox does not sit through it: cursord sees `idle` on its poll, waits out a threshold of its own — five minutes in this build — and exits, reporting that it is going so the control plane can retire the row rather than wait for the heartbeat to go stale.
+
+The threshold lives in the container because the container is what it spends. The control plane would be deciding how long someone else's process should live, and it is the wrong side to be holding that opinion.
+
+**Resume.** A user message on an `idle` session picks the same session up again. If the sandbox has already exited, a new one is spawned at a new epoch; it clones, resets to `last_accepted_sha`, and the pending tool call is dispatched to it. This is the recovery path, run deliberately rather than in response to a death — which is why the design can afford to let an idle container go in the first place. The cost is a clone on the next message, and the thing bought is that an abandoned tab stops costing a machine.
+
+Only `failed` and `cancelled` close a session for good.
 
 **Sandbox dies.** cursord heartbeats every few seconds. When heartbeats stop for longer than the threshold, ten seconds in this build, the session is marked `sandbox_dead` and a replacement is spawned at a new epoch. It clones, checks out the branch, and starts polling. Any pending tool call is still pending and gets dispatched to the new sandbox.
 
@@ -219,12 +229,11 @@ Text and thinking are written as whole events when the LLM call returns.
     4. Base_sha, text
     5. Last_accepted_sha, text
     6. Status, enum
-        1. Awaiting_user
+        1. Idle — the turn ended; no sandbox, and the next move is the user's
         2. Thinking
         3. Executing
-        4. Complete
-        5. Failed
-        6. Cancelled
+        4. Failed
+        5. Cancelled
     7. Epoch, int
     8. Curr_message_seq, int
     9. Curr_event_seq, int
@@ -235,7 +244,7 @@ Text and thinking are written as whole events when the LLM call returns.
     2. Session_id, uuid, foreign key
     3. Epoch, int
     4. Container_id, int
-    5. Status, text
+    5. Status, text — spawning, ready, dead, replaced, exited
     6. Last_heartbeat_at, timestamp
 3. Messages
     1. Id, uuid primary key

@@ -18,9 +18,20 @@ Control plane for a local version of a cloud coding agent. Design lives in
 | `agent/` | The container image and `cursord`, the daemon inside it. |
 | `client/` | The browser client. Enqueues tasks and renders the event feed. |
 
-`db/schema.sql` is what actually runs and is applied on startup.
-`docs/schema.sql` is the design document, and additionally carries the three
-illustrative queries.
+`control/schema.sql` is the schema. It is applied by hand rather than on
+boot:
+
+```bash
+./scripts/postgres.sh psql -f control/schema.sql
+```
+
+It is written to be safe to re-apply. The tables are `CREATE ... IF NOT
+EXISTS`, which covers a new database and skips an existing one entirely, so
+anything that has to change on a database already in use — a widened CHECK
+constraint, a new column — is repeated in the `in-place changes` section at
+the bottom of the file. Those must land with the code that writes the new
+values, since a constraint tightened ahead of its code rejects what the
+control plane is still sending.
 
 ## Setup
 
