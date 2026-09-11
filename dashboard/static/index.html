@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cloud Agent Operations</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">Cloud Agent</p>
+      <h1>Operations</h1>
+    </div>
+    <div class="controls">
+      <label>Window
+        <select id="window">
+          <option value="6">6 hours</option>
+          <option value="24" selected>24 hours</option>
+          <option value="72">3 days</option>
+          <option value="168">7 days</option>
+        </select>
+      </label>
+      <span id="freshness" class="freshness">Loading…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="tiles" aria-label="Top-line metrics">
+      <article class="tile" id="activity"></article>
+      <article class="tile" id="active-states"></article>
+      <article class="tile" id="turn-duration"></article>
+      <article class="tile" id="queue"></article>
+      <article class="tile" id="recovery"></article>
+      <article class="tile" id="llm"></article>
+      <article class="tile" id="cost"></article>
+      <article class="tile" id="reexecution"></article>
+    </section>
+
+    <section class="secondary">
+      <div>
+        <p class="eyebrow">Details</p>
+        <h2>Phase timing and loop health</h2>
+      </div>
+      <div id="secondary-grid" class="secondary-grid"></div>
+    </section>
+  </main>
+
+  <div id="error" class="error" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -64,6 +64,19 @@ GROK_API_KEY: Optional[str] = os.environ.get("GROK_API_KEY") or None
 
 GROK_MODEL = _flag("GROK_MODEL", "grok-4.6")
 
+# Optional pricing snapshot used when each attempt is recorded. Leaving either
+# unset keeps cost null rather than presenting an unknown price as zero.
+GROK_INPUT_COST_PER_MILLION: Optional[float] = (
+    float(os.environ["GROK_INPUT_COST_PER_MILLION"])
+    if os.environ.get("GROK_INPUT_COST_PER_MILLION")
+    else None
+)
+GROK_OUTPUT_COST_PER_MILLION: Optional[float] = (
+    float(os.environ["GROK_OUTPUT_COST_PER_MILLION"])
+    if os.environ.get("GROK_OUTPUT_COST_PER_MILLION")
+    else None
+)
+
 # Seconds per HTTP attempt. advance() holds no lock while it waits, so a large
 # value costs a parked thread and nothing else.
 GROK_TIMEOUT_SECONDS = float(_flag("GROK_TIMEOUT", "300"))

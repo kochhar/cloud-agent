@@ -55,6 +55,8 @@ Configuration:
 | `DASHBOARD_DB_POOL_MAX` | `4` | Maximum dashboard connections |
 | `DASHBOARD_STATEMENT_TIMEOUT_MS` | `3000` | Per-query ceiling |
 | `DASHBOARD_CACHE_SECONDS` | `10` | Snapshot cache lifetime |
+| `GROK_INPUT_COST_PER_MILLION` | unset | USD per million input tokens |
+| `GROK_OUTPUT_COST_PER_MILLION` | unset | USD per million output tokens |
 
 The pool also sets `default_transaction_read_only=on`. Production should use a
 database role that cannot write even if the application is misconfigured:
@@ -88,8 +90,13 @@ All values use the selected dashboard window unless noted otherwise.
 5. **Sandbox recovery.** Death events and sessions that subsequently reached
    `idle`. Unresolved sessions are displayed but excluded from the success
    denominator.
-6. **LLM latency and errors.** Not collected in Postgres.
-7. **Cost per completed turn.** Not collected in Postgres.
+6. **LLM latency and errors.** Successful-attempt p50/p95/p99 latency,
+   retry-inclusive attempt error rate, terminal logical-call error rate, error
+   causes, and stale in-flight attempts from `llm_attempts`.
+7. **Cost per completed turn.** Estimated model cost in the selected window
+   divided by completed turn outcomes in that window. This is an operational
+   ratio, not per-turn attribution. It is unavailable unless both token prices
+   are configured and every successful attempt in the window is priced.
 8. **Re-execution.** Calls with `attempts > 1` divided by calls with at least
    one dispatch.
 
@@ -99,8 +106,20 @@ mark, oldest thinking age, and executing sessions with no open tool call.
 “Dispatch to result” includes daemon execution, checkpoint/push, and HTTP
 reporting; it is not labeled as pure tool execution.
 
+The model retry loop inserts an `in_flight` row before each provider request
+and updates it afterward. Attempts in one retry sequence share `call_id`;
+`is_final` identifies the success or terminal failure. A control process that
+dies during provider I/O deliberately leaves an in-flight row behind.
+
 The dashboard never substitutes zero for unavailable telemetry. Every snapshot
 includes its generation time, metric definitions, and cohort/sample counts.
+For simple retention, periodically delete old completed attempts while keeping
+recent in-flight rows available for stuck-call diagnosis:
+
+```sql
+DELETE FROM llm_attempts
+ WHERE completed_at < now() - interval '90 days';
+```
 
 ## Deployment
 
@@ -122,9 +141,8 @@ applies a statement timeout. A read replica can replace the primary in
 The next telemetry increment should stay small and must not use session,
 action, provider-call, or container IDs as metric labels.
 
-- Control counters/histograms: advance claims won/lost, LLM attempts and
-  latency by outcome, token totals, DB checkout wait, held long polls, poll
-  query count, stale-epoch rejection reason.
+- Control counters/histograms: advance claims won/lost, DB checkout wait, held
+  long polls, poll query count, and stale-epoch rejection reason.
 - Daemon counters/histograms: actual tool duration by tool and exit-code
   class, clone/recovery duration, commit/push duration and failure class,
   stale 409s, heartbeat interval drift.

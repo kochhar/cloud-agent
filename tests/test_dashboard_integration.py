@@ -120,6 +120,36 @@ class DashboardIntegrationTests(unittest.TestCase):
             (recovered, message_ids[0], pending, message_ids[1]),
         )
 
+        retried_call = uuid.uuid4()
+        failed_call = uuid.uuid4()
+        cls.admin.execute(
+            """
+            INSERT INTO llm_attempts
+                (session_id, call_id, attempt, is_final, provider, model, outcome,
+                 http_status, input_tokens, output_tokens, context_chars,
+                 message_count, tool_call_count, estimated_cost_usd,
+                 duration_ms, completed_at, started_at)
+            VALUES
+                (%s, %s, 1, false, 'xai', 'test-model', 'rate_limit',
+                 429, NULL, NULL, 1000, 4, NULL, NULL,
+                 100, now() - interval '29 minutes', now() - interval '29 minutes'),
+                (%s, %s, 2, true, 'xai', 'test-model', 'success',
+                 200, 1000, 100, 1000, 4, 1, 0.03,
+                 1000, now() - interval '28 minutes', now() - interval '28 minutes'),
+                (%s, %s, 1, true, 'xai', 'test-model', 'timeout',
+                 NULL, NULL, NULL, 500, 2, NULL, NULL,
+                 3000, now() - interval '19 minutes', now() - interval '19 minutes')
+            """,
+            (
+                recovered,
+                retried_call,
+                recovered,
+                retried_call,
+                failed,
+                failed_call,
+            ),
+        )
+
     def test_overview_uses_exact_postgres_cohorts(self) -> None:
         app = create_app(self.pool)
         with TestClient(app) as client:
@@ -138,7 +168,16 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertEqual(data["tiles"]["recovery"]["success_rate"], 1)
             self.assertEqual(data["tiles"]["reexecution"]["reexecuted_calls"], 1)
             self.assertFalse(data["tiles"]["turn_duration"]["available"])
-            self.assertFalse(data["tiles"]["llm"]["available"])
+            self.assertTrue(data["tiles"]["llm"]["available"])
+            self.assertAlmostEqual(
+                data["tiles"]["llm"]["attempt_error_rate"], 2 / 3
+            )
+            self.assertEqual(data["tiles"]["llm"]["final_call_error_rate"], 0.5)
+            self.assertEqual(data["tiles"]["llm"]["p95_ms"], 1000)
+            self.assertTrue(data["tiles"]["cost"]["available"])
+            self.assertEqual(
+                data["tiles"]["cost"]["cost_per_completed_turn_usd"], 0.03
+            )
             self.assertEqual(client.get("/healthz").status_code, 200)
             self.assertEqual(client.get("/api/overview?hours=169").status_code, 422)
 

@@ -23,6 +23,7 @@ import httpx
 
 import config
 import log_context
+import telemetry
 import tools
 
 logger = logging.getLogger(__name__)
@@ -165,23 +166,38 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
         "tool_choice": "auto",
     }
     headers = {"Authorization": "Bearer {}".format(config.GROK_API_KEY)}
+    call_id = str(uuid.uuid4())
+    context_chars = _context_chars(context)
 
     last: Optional[Exception] = None
     for attempt in range(1, config.GROK_MAX_ATTEMPTS + 1):
+        telemetry_id = (
+            telemetry.start_llm_attempt(
+                session_id=session_id,
+                call_id=call_id,
+                attempt=attempt,
+                provider="xai",
+                model=config.GROK_MODEL,
+                context_chars=context_chars,
+                message_count=len(context),
+            )
+            if session_id is not None
+            else None
+        )
         logger.info(
             "grok request %s attempt %s/%s: %s messages, ~%s chars, %s tools",
             config.GROK_MODEL,
             attempt,
             config.GROK_MAX_ATTEMPTS,
             len(context),
-            _context_chars(context),
+            context_chars,
             len(tools.TOOL_SCHEMAS),
             extra={
                 "event": "llm_request",
                 "attempt": attempt,
                 "model": config.GROK_MODEL,
                 "message_count": len(context),
-                "context_chars": _context_chars(context),
+                "context_chars": context_chars,
                 "tool_count": len(tools.TOOL_SCHEMAS),
             },
         )
@@ -192,19 +208,26 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
                 "/chat/completions", json=body, headers=headers
             )
         except httpx.HTTPError as exc:
+            elapsed = time.monotonic() - started
+            category = (
+                "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
+            )
             last = ProviderError("could not reach the provider: {}".format(exc))
+            telemetry.finish_llm_attempt(
+                telemetry_id,
+                outcome=category,
+                is_final=attempt == config.GROK_MAX_ATTEMPTS,
+                duration_ms=round(elapsed * 1000, 3),
+            )
             logger.warning(
                 "grok unreachable after %.1fs: %s",
-                time.monotonic() - started,
+                elapsed,
                 exc,
                 extra={
                     "event": "llm_error",
                     "attempt": attempt,
-                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
-                    "error_category": (
-                        "timeout" if isinstance(exc, httpx.TimeoutException)
-                        else "transport"
-                    ),
+                    "duration_ms": round(elapsed * 1000, 3),
+                    "error_category": category,
                     "model": config.GROK_MODEL,
                 },
             )
@@ -218,6 +241,13 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
                 except (ProviderError, ValueError, TypeError, KeyError) as exc:
                     last = ProviderError(
                         "provider returned a malformed response: {}".format(exc)
+                    )
+                    telemetry.finish_llm_attempt(
+                        telemetry_id,
+                        outcome="malformed_response",
+                        is_final=True,
+                        duration_ms=round(elapsed * 1000, 3),
+                        http_status=response.status_code,
                     )
                     logger.warning(
                         "grok returned malformed JSON after %.1fs: %s",
@@ -234,6 +264,16 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
                     )
                     break
                 usage = payload.get("usage") or {}
+                telemetry.finish_llm_attempt(
+                    telemetry_id,
+                    outcome="success",
+                    is_final=True,
+                    duration_ms=round(elapsed * 1000, 3),
+                    http_status=response.status_code,
+                    input_tokens=usage.get("prompt_tokens"),
+                    output_tokens=usage.get("completion_tokens"),
+                    tool_call_count=len(reply.tool_calls),
+                )
                 # Elapsed matters: a turn outlasting the sandbox's read
                 # timeout is what makes cursord retry an accepted result.
                 logger.info(
@@ -262,6 +302,15 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
             last = ProviderError(
                 "provider returned {}: {}".format(response.status_code, detail)
             )
+            category = _http_error_category(response.status_code)
+            retryable = response.status_code in _RETRY_STATUSES
+            telemetry.finish_llm_attempt(
+                telemetry_id,
+                outcome=category,
+                is_final=not retryable or attempt == config.GROK_MAX_ATTEMPTS,
+                duration_ms=round(elapsed * 1000, 3),
+                http_status=response.status_code,
+            )
             logger.warning(
                 "grok response %s in %.1fs: %s",
                 response.status_code,
@@ -272,11 +321,11 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
                     "attempt": attempt,
                     "duration_ms": round(elapsed * 1000, 3),
                     "status_code": response.status_code,
-                    "error_category": _http_error_category(response.status_code),
+                    "error_category": category,
                     "model": config.GROK_MODEL,
                 },
             )
-            if response.status_code not in _RETRY_STATUSES:
+            if not retryable:
                 break
 
         if attempt < config.GROK_MAX_ATTEMPTS:

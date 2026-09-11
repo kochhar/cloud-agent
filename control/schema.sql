@@ -120,6 +120,49 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_session_seq_idx ON messages (session_id, seq);
 
 -- ---------------------------------------------------------------
+-- llm_attempts — one durable row for every provider HTTP attempt
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS llm_attempts (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id          uuid        NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    call_id             uuid        NOT NULL,
+    attempt             int         NOT NULL CHECK (attempt > 0),
+    is_final            boolean     NOT NULL DEFAULT false,
+
+    provider            text        NOT NULL,
+    model               text        NOT NULL,
+    outcome             text        NOT NULL DEFAULT 'in_flight'
+                          CHECK (outcome IN (
+                            'in_flight','success','rate_limit','timeout',
+                            'provider_5xx','provider_4xx','malformed_response',
+                            'transport')),
+    http_status         int,
+
+    input_tokens        int,
+    output_tokens       int,
+    context_chars       int         NOT NULL,
+    message_count       int         NOT NULL,
+    tool_call_count     int,
+    estimated_cost_usd  numeric(14,8),
+
+    duration_ms         double precision,
+    started_at          timestamptz NOT NULL DEFAULT now(),
+    completed_at        timestamptz,
+
+    UNIQUE (call_id, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS llm_attempts_started_idx
+    ON llm_attempts (started_at);
+
+CREATE INDEX IF NOT EXISTS llm_attempts_session_idx
+    ON llm_attempts (session_id, started_at);
+
+CREATE INDEX IF NOT EXISTS llm_attempts_in_flight_idx
+    ON llm_attempts (started_at)
+    WHERE outcome = 'in_flight';
+
+-- ---------------------------------------------------------------
 -- tool_calls  — the execution ledger. Recovery logic lives here.
 -- ---------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS tool_calls (
