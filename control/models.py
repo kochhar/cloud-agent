@@ -1,8 +1,4 @@
-"""Row objects for the control plane tables.
-
-Each class maps onto one table in db/schema.sql, so the field names have to
-keep matching the column names.
-"""
+"""Row objects for the control plane tables. Field names must match columns."""
 
 from __future__ import annotations
 
@@ -12,15 +8,13 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 # sessions.status, mirroring the CHECK constraint on the table
-IDLE = "idle"                    # no sandbox; the turn ended, waiting on the user
-THINKING = "thinking"            # an instance is inside the LLM call
+IDLE = "idle"                    # no sandbox; waiting on the user
+THINKING = "thinking"            # inside the LLM call
 EXECUTING = "executing"          # tool calls outstanding
 FAILED = "failed"
 CANCELLED = "cancelled"
 
-# Takes no more input, ever. 'idle' is deliberately not here: a turn that ends
-# without tool calls is finished, not closed, and the next user message picks
-# the same session up again.
+# Accepts no further input. 'idle' is not terminal; a new user message resumes it.
 TERMINAL_STATUSES = frozenset({FAILED, CANCELLED})
 
 

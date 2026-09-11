@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional, Sequence
 import httpx
 
 import config
+import log_context
 import tools
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,25 @@ Use the tools below to inspect and modify the repository. Constraints:
 - You have no git tools. Commits and branches are handled for you.
 - Write files with their full contents, never a partial patch.
 
+Your sandbox can die mid-task and be replaced. When that happens a tool result
+arrives with a [repeat] marker, meaning the call was dispatched again and may
+have executed more than once. You are the one who decides what to do about it:
+- Your workspace is rebuilt from the last commit that was accepted, so file
+  edits made by the lost attempt are already undone. Do not re-apply them and
+  do not clean them up.
+- What does not roll back is anything a command sent outside the workspace: a
+  pull request or issue comment, a published package, a deploy or a triggered
+  workflow, a write to a shared database, a webhook, a message. Those can
+  land twice.
+- So on a [repeat] of a command that did one of those, look at the current
+  state before doing it again, and prefer a command that checks and then acts
+  over one that blindly repeats. On a [repeat] of anything else — a build, a
+  test run, a search, a read — just carry on.
+
 When the task is done, reply with a summary and no tool calls.
 """
 
-# Rendered from tools.TOOL_SCHEMAS rather than written out again, so the prompt
-# cannot drift from the schemas the provider is sent.
+# Rendered from TOOL_SCHEMAS so the prompt cannot drift from what is sent.
 SYSTEM_PROMPT = _BASE_PROMPT.rstrip() + "\n\n" + tools.render()
 
 
@@ -65,8 +80,7 @@ class Reply:
     reasoning: Optional[str] = None
     tool_calls: Sequence[ToolCall] = ()
 
-    # The provider's own tool_calls array, kept byte-for-byte when the reply
-    # came from a provider. Scripted clients leave it None.
+    # The provider's own array, kept byte-for-byte. None for scripted clients.
     raw: Optional[list] = None
 
     @property
@@ -80,8 +94,8 @@ class Reply:
             {
                 "id": call.provider_call_id,
                 "type": "function",
-                # A string, not an object: that is what the API emits, and
-                # replaying it in any other shape is a different request.
+                # A JSON string, not an object: replaying it in any other
+                # shape is a different request.
                 "function": {
                     "name": call.name,
                     "arguments": json.dumps(call.args),
@@ -106,21 +120,20 @@ def use(client: Optional[Client]) -> None:
 def complete(context: list, session_id: Optional[str] = None) -> Reply:
     """One model turn. An installed client wins, so tests never hit the network.
 
-    `session_id` is only ever used to label log lines. It is not passed to an
-    installed client, so the Client signature stays one argument and every
-    scripted stub keeps working.
+    `session_id` only labels log lines, and is not passed to an installed
+    client, so the Client signature stays one argument.
     """
     if _client is not None:
         return _client(context)
-    return _grok(context, session_id)
+    with log_context.bind(session_id=session_id):
+        return _grok(context, session_id)
 
 
 # ---------- ---------- ----------
 # Grok
 # ---------- ---------- ----------
 
-# Retried: the provider is busy or briefly broken, and the turn is idempotent
-# because nothing has been written yet.
+# Safe to retry: nothing has been written yet, so the turn is idempotent.
 _RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504})
 
 _http: Optional[httpx.Client] = None
@@ -153,22 +166,24 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
     }
     headers = {"Authorization": "Bearer {}".format(config.GROK_API_KEY)}
 
-    # Turns run in the request threadpool, so several can be in the air at
-    # once and their log lines interleave. Every line below carries this, so
-    # a call and its answer can be paired back up.
-    tag = "[{}]".format(session_id[:8] if session_id else "?")
-
     last: Optional[Exception] = None
     for attempt in range(1, config.GROK_MAX_ATTEMPTS + 1):
         logger.info(
-            "%s grok request  %s attempt %s/%s: %s messages, ~%s chars, %s tools",
-            tag,
+            "grok request %s attempt %s/%s: %s messages, ~%s chars, %s tools",
             config.GROK_MODEL,
             attempt,
             config.GROK_MAX_ATTEMPTS,
             len(context),
             _context_chars(context),
             len(tools.TOOL_SCHEMAS),
+            extra={
+                "event": "llm_request",
+                "attempt": attempt,
+                "model": config.GROK_MODEL,
+                "message_count": len(context),
+                "context_chars": _context_chars(context),
+                "tool_count": len(tools.TOOL_SCHEMAS),
+            },
         )
 
         started = time.monotonic()
@@ -179,38 +194,87 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
         except httpx.HTTPError as exc:
             last = ProviderError("could not reach the provider: {}".format(exc))
             logger.warning(
-                "%s grok unreachable after %.1fs: %s", tag, time.monotonic() - started, exc
+                "grok unreachable after %.1fs: %s",
+                time.monotonic() - started,
+                exc,
+                extra={
+                    "event": "llm_error",
+                    "attempt": attempt,
+                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    "error_category": (
+                        "timeout" if isinstance(exc, httpx.TimeoutException)
+                        else "transport"
+                    ),
+                    "model": config.GROK_MODEL,
+                },
             )
         else:
             elapsed = time.monotonic() - started
 
             if response.status_code == 200:
-                payload = response.json()
-                reply = _parse(payload)
-                # The elapsed time is the number that matters here: a turn
-                # outlasting the sandbox's read timeout is what makes cursord
-                # retry a result the control plane already took.
+                try:
+                    payload = response.json()
+                    reply = _parse(payload)
+                except (ProviderError, ValueError, TypeError, KeyError) as exc:
+                    last = ProviderError(
+                        "provider returned a malformed response: {}".format(exc)
+                    )
+                    logger.warning(
+                        "grok returned malformed JSON after %.1fs: %s",
+                        elapsed,
+                        exc,
+                        extra={
+                            "event": "llm_error",
+                            "attempt": attempt,
+                            "duration_ms": round(elapsed * 1000, 3),
+                            "status_code": response.status_code,
+                            "error_category": "malformed_response",
+                            "model": config.GROK_MODEL,
+                        },
+                    )
+                    break
+                usage = payload.get("usage") or {}
+                # Elapsed matters: a turn outlasting the sandbox's read
+                # timeout is what makes cursord retry an accepted result.
                 logger.info(
-                    "%s grok response %s in %.1fs: %s",
-                    tag,
+                    "grok response %s in %.1fs: %s",
                     config.GROK_MODEL,
                     elapsed,
                     _describe(payload, reply),
+                    extra={
+                        "event": "llm_response",
+                        "attempt": attempt,
+                        "duration_ms": round(elapsed * 1000, 3),
+                        "status_code": response.status_code,
+                        "model": config.GROK_MODEL,
+                        "tokens_in": usage.get("prompt_tokens"),
+                        "tokens_out": usage.get("completion_tokens"),
+                        "tool_count": len(reply.tool_calls),
+                        "finish_reason": (
+                            (payload.get("choices") or [{}])[0].get("finish_reason")
+                        ),
+                    },
                 )
                 return reply
 
-            # The body carries the reason; the key is only in the request
-            # headers, so this is safe to log and to surface to the client.
+            # Safe to log: the key is in the request headers, not the body.
             detail = response.text.strip()[:500]
             last = ProviderError(
                 "provider returned {}: {}".format(response.status_code, detail)
             )
             logger.warning(
-                "%s grok response %s in %.1fs: %s",
-                tag,
+                "grok response %s in %.1fs: %s",
                 response.status_code,
                 elapsed,
                 detail,
+                extra={
+                    "event": "llm_error",
+                    "attempt": attempt,
+                    "duration_ms": round(elapsed * 1000, 3),
+                    "status_code": response.status_code,
+                    "error_category": _http_error_category(response.status_code),
+                    "model": config.GROK_MODEL,
+                },
             )
             if response.status_code not in _RETRY_STATUSES:
                 break
@@ -218,12 +282,17 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
         if attempt < config.GROK_MAX_ATTEMPTS:
             delay = _backoff(attempt)
             logger.warning(
-                "%s grok attempt %s/%s failed (%s); retrying in %.1fs",
-                tag,
+                "grok attempt %s/%s failed (%s); retrying in %.1fs",
                 attempt,
                 config.GROK_MAX_ATTEMPTS,
                 last,
                 delay,
+                extra={
+                    "event": "llm_retry",
+                    "attempt": attempt,
+                    "error_category": "retry",
+                    "model": config.GROK_MODEL,
+                },
             )
             time.sleep(delay)
 
@@ -233,6 +302,16 @@ def _grok(context: list, session_id: Optional[str] = None) -> Reply:
 def _context_chars(context: list) -> int:
     """Roughly how much is going up. Sizes only, never the content itself."""
     return sum(len(message.get("content") or "") for message in context)
+
+
+def _http_error_category(status_code: int) -> str:
+    if status_code == 429:
+        return "rate_limit"
+    if status_code == 408:
+        return "timeout"
+    if status_code >= 500:
+        return "provider_5xx"
+    return "provider_4xx"
 
 
 def _describe(payload: dict, reply: Reply) -> str:
@@ -277,9 +356,8 @@ def _parse(payload: dict) -> Reply:
 
     message = choices[0].get("message") or {}
 
-    # A refusal arrives instead of content, and reads to the loop as an
-    # ordinary final answer: no tool calls, so the turn ends and the user sees
-    # why rather than an empty bubble.
+    # A refusal arrives instead of content, and reads as an ordinary final
+    # answer: no tool calls, so the turn ends showing why.
     text = message.get("content") or message.get("refusal") or None
 
     # Named reasoning_content on xAI, reasoning elsewhere.
@@ -305,21 +383,34 @@ def _tool_call(entry: dict) -> ToolCall:
         try:
             args = json.loads(arguments or "{}")
         except ValueError:
-            # Not worth failing the session over. Dispatching with no
-            # arguments makes the sandbox report a missing-argument error,
-            # which is the feedback the model needs to try again.
-            logger.warning("unparseable arguments for tool %s: %r", name, arguments)
+            # Dispatched anyway: the sandbox reports a missing-argument error,
+            # which is the feedback the model needs to retry.
+            logger.warning(
+                "unparseable arguments for tool %s: %r",
+                name,
+                arguments,
+                extra={
+                    "event": "llm_malformed_tool_call",
+                    "error_category": "malformed_tool_call",
+                },
+            )
             args = {}
 
     if name not in tools.TOOL_NAMES:
-        # Still dispatched: the sandbox rejects it and tells the model, which
-        # is a better outcome than the loop dying on a hallucinated name.
-        logger.warning("model asked for unknown tool %r", name)
+        # Also dispatched: the sandbox rejects it and tells the model, rather
+        # than the loop dying on a hallucinated name.
+        logger.warning(
+            "model asked for unknown tool %r",
+            name,
+            extra={
+                "event": "llm_unknown_tool",
+                "error_category": "malformed_tool_call",
+            },
+        )
 
     return ToolCall(
         name=name,
         args=args,
-        # The provider's id, so the tool message we send back matches the call
-        # it is answering.
+        # The provider's id, so our tool message matches the call it answers.
         provider_call_id=entry.get("id") or uuid.uuid4().hex,
     )

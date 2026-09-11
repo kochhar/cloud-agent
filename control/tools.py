@@ -1,12 +1,10 @@
 """The tools the model is allowed to call.
 
-Git is deliberately absent. Commits and branches belong to cursord, and
-exposing them here would let model-authored commits collide with
-checkpointing.
+No git tools: commits and branches belong to cursord, and model-authored
+commits would collide with checkpointing.
 
-TOOL_SCHEMAS is the single source of truth: it goes to the provider as the
-tools array, and render() turns the same data into the prose block appended
-to the system prompt.
+TOOL_SCHEMAS is the single source of truth. It is sent to the provider as the
+tools array, and render() turns it into prose for the system prompt.
 """
 
 from __future__ import annotations
@@ -83,6 +81,11 @@ TOOL_SCHEMAS = [
 ]
 
 TOOL_NAMES = frozenset(schema["function"]["name"] for schema in TOOL_SCHEMAS)
+
+# Tools whose re-execution is disclosed to the model. Only run_command can
+# leave anything behind: reads are pure, and a repeated write_file overwrites
+# with full contents onto a workspace rebuilt from the last accepted commit.
+AUDIT_ON_REPEAT = frozenset({"run_command"})
 
 
 def _signature(function: dict) -> str:

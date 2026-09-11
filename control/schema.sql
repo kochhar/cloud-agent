@@ -131,6 +131,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     name                text        NOT NULL,
     args                jsonb       NOT NULL,
 
+    -- Position in the batch the model asked for, and the dispatch order.
+    -- created_at cannot do this job: it defaults to now(), which is the
+    -- transaction timestamp, so every call in a batch ties and the order a
+    -- parallel batch runs in would be arbitrary.
+    ordinal             int         NOT NULL DEFAULT 0,
+
     status              text        NOT NULL DEFAULT 'pending'
                           CHECK (status IN ('pending','dispatched','done','failed')),
 
@@ -154,6 +160,12 @@ CREATE INDEX IF NOT EXISTS tool_calls_pending_idx
     ON tool_calls (session_id)
     WHERE status IN ('pending','dispatched');
 
+-- dashboard: exact queue age is available before the first dispatch. A
+-- requeued call has no pending_since timestamp, so it is deliberately absent.
+CREATE INDEX IF NOT EXISTS tool_calls_never_dispatched_pending_idx
+    ON tool_calls (created_at)
+    WHERE status = 'pending' AND attempts = 0;
+
 -- ---------------------------------------------------------------
 -- events  — the UI feed
 -- ---------------------------------------------------------------
@@ -165,18 +177,30 @@ CREATE TABLE IF NOT EXISTS events (
     -- kept apart from 'sandbox_died' so the feed can say the session
     -- finished and its container left, rather than implying a crash every
     -- time a turn ends.
+    -- No 'sandbox_replaced': a replacement is one death and one spawn, and
+    -- 'sandbox_died' already carries replaced_by.
     type                text        NOT NULL
                           CHECK (type IN (
                             'thinking','text','status',
-                            'tool_started','tool_finished',
+                            'tool_started','tool_finished','tool_requeued',
                             'sandbox_spawning','sandbox_ready',
-                            'sandbox_died','sandbox_replaced',
-                            'sandbox_exited')),
+                            'sandbox_died','sandbox_exited')),
     payload             jsonb       NOT NULL,
     created_at          timestamptz NOT NULL DEFAULT now(),
 
     PRIMARY KEY (session_id, seq)
 );
+
+-- dashboard: bounded outcome time series and per-session recovery cohorts.
+CREATE INDEX IF NOT EXISTS events_status_history_idx
+    ON events (created_at, ((payload ->> 'status')))
+    WHERE type = 'status';
+
+CREATE INDEX IF NOT EXISTS events_type_created_idx
+    ON events (type, created_at);
+
+CREATE INDEX IF NOT EXISTS events_session_lifecycle_idx
+    ON events (session_id, type, created_at);
 
 -- ---------------------------------------------------------------
 -- in-place changes
@@ -203,6 +227,10 @@ CREATE TABLE IF NOT EXISTS events (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS diff_preview text;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS diff_stat    jsonb;
 
+-- tool_calls gains the dispatch order. Existing rows default to 0, which
+-- leaves them tied with each other exactly as they already were.
+ALTER TABLE tool_calls ADD COLUMN IF NOT EXISTS ordinal int NOT NULL DEFAULT 0;
+
 -- sessions.status: 'awaiting_user' and 'completed' collapse into 'idle'.
 -- The constraint comes off first because the rows cannot hold the new value
 -- while the old one is still enforced.
@@ -222,11 +250,18 @@ ALTER TABLE sandboxes ADD CONSTRAINT sandboxes_status_check
     CHECK (status IN ('spawning','ready','dead','replaced','exited'));
 
 -- events.type: 'sandbox_exited' joins the lifecycle set, so the clean
--- shutdown has something to say to the client.
+-- shutdown has something to say to the client, and 'tool_requeued' so the
+-- feed can show a call being handed to a replacement sandbox.
+--
+-- 'sandbox_replaced' leaves it. It was declared but never written by any code
+-- path, and a replacement is already two events: the death, carrying
+-- replaced_by, and the spawn of the epoch that took over.
 ALTER TABLE events DROP CONSTRAINT IF EXISTS events_type_check;
+
+DELETE FROM events WHERE type = 'sandbox_replaced';
 
 ALTER TABLE events ADD CONSTRAINT events_type_check
     CHECK (type IN ('thinking','text','status',
-                    'tool_started','tool_finished',
+                    'tool_started','tool_finished','tool_requeued',
                     'sandbox_spawning','sandbox_ready',
-                    'sandbox_died','sandbox_replaced','sandbox_exited'));
+                    'sandbox_died','sandbox_exited'));

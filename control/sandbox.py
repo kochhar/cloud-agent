@@ -1,9 +1,9 @@
 """Sandbox lifecycle.
 
-A container can vanish at any moment. The session is protected by the epoch:
-it is bumped every time a sandbox is spawned, and cursord carries the epoch when it
-was born. A container that comes back from the dead has an epoch behind the session's, 
-so nothing it reports is accepted and it is never handed more work.
+A container can vanish at any moment, so the epoch fences it: bumped on every
+spawn, and carried by cursord from its birth. A container that comes back from
+the dead is behind the session, so nothing it reports is accepted and it is
+never handed more work.
 """
 
 from __future__ import annotations
@@ -16,8 +16,10 @@ import sys
 from typing import Optional
 
 import config
+import log_context
 import sessions
 from db import pool
+from models import FAILED, TERMINAL_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -30,70 +32,147 @@ class SandboxNotRegistered(Exception):
     """A heartbeat arrived for an epoch that has no sandbox row."""
 
 
-# Reasons a sandbox can stop with nothing wrong, matching what cursord sends
-# from __main__.main. Anything else it reports on the way out is a sandbox
-# that stopped early, which is the reaper's problem even though this one was
-# polite enough to say so. The sandbox reports what happened; deciding
-# whether that needs a replacement is not its call.
+# Reasons a sandbox can stop with nothing wrong, matching what cursord sends:
 #
-#   idle              the session finished its turn and nobody came back
+#   idle              the turn ended and nobody came back
 #   session_finished  the session reached 'failed' or 'cancelled'
 #
-# 'idle' has to be here. It is the ordinary end of a conversation, and
-# reading it as a crash would have the reaper replace a sandbox that left
-# because there was nothing to do — which would go idle and leave again.
+# Anything else it reports is treated as a crash. 'idle' must be here: reading
+# it as a crash would replace a sandbox that left because there was no work,
+# which would go idle and leave again.
 CLEAN_EXITS = frozenset({"idle", "session_finished"})
 
+# Sandbox statuses that can still serve a session. Anything else has stopped.
+LIVE_STATUSES = ("spawning", "ready")
 
-def spawn(session_id: str) -> dict:
+
+@log_context.correlated
+def spawn(
+    session_id: str,
+    expect_epoch: int | None = None,
+    reason: str | None = None,
+) -> dict:
     """Open a new epoch for the session and start a container against it.
 
-    The row is committed before the container is started, so a crash midway
-    leaves a recoverable sandbox row rather than an orphaned container.
+    The row is committed before the container starts, so a crash midway leaves
+    a recoverable sandbox row rather than an orphaned container.
+
+    `expect_epoch` makes replacement exactly-once: it turns the bump into a
+    compare-and-swap, so several instances finding the same dead sandbox
+    produce one replacement between them. None from create_session, which has
+    no previous epoch to compare against.
+
+    `reason` is why the previous sandbox is being replaced, recorded on the
+    event feed. None for a first spawn.
     """
+    # Set when the epoch ceiling is hit. The write goes inside the transaction
+    # and the raise waits until after the commit that would roll it back.
+    failure: str | None = None
+    epoch = repo_url = branch = sandbox_id = None
+
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # The UPDATE takes the row lock, so two instances spawning at once
-            # get different epochs rather than the same one.
+            # The lock is held for the whole transaction, which is what
+            # serialises concurrent spawns: a second instance blocks here and
+            # then reads an epoch that has already moved.
+            #
+            # Read-then-check rather than a blind UPDATE, so each refusal
+            # below can say which one it was.
             cur.execute(
-                "UPDATE sessions SET current_epoch = current_epoch + 1, updated_at = now() "
-                "WHERE id = %s AND status NOT IN ('failed','cancelled') "
-                "RETURNING current_epoch, repo_url, branch",
+                "SELECT status, current_epoch, repo_url, branch "
+                "FROM sessions WHERE id = %s FOR UPDATE",
                 (session_id,),
             )
-            
             row = cur.fetchone()
+
             if row is None:
-                # Either the id is unknown or the session is already finished.
-                # Not worth a second query to tell them apart: the only caller
-                # is create_session, which just inserted the row, so in
-                # practice this is always a terminal session.
+                raise SpawnRefused(f"no session {session_id}")
+            if row["status"] in TERMINAL_STATUSES:
                 raise SpawnRefused(
-                    f"session {session_id} cannot take a new sandbox"
+                    f"session {session_id} is {row['status']} and wants no sandbox"
                 )
 
-            epoch = row["current_epoch"]
-            repo_url = row["repo_url"]
-            branch = row["branch"]
+            previous = row["current_epoch"]
+            if expect_epoch is not None and previous != expect_epoch:
+                raise SpawnRefused(
+                    f"session {session_id} is at epoch {previous}, not {expect_epoch}; "
+                    "another instance replaced it first"
+                )
 
+            # The ceiling counts sandboxes that were lost, not epochs. An
+            # ordinary resume opens an epoch too, so counting epochs would
+            # fail a healthy conversation for having had gaps in it.
             cur.execute(
-                "INSERT INTO sandboxes (session_id, epoch, status) "
-                "VALUES (%s, %s, 'spawning') RETURNING id",
-                (session_id, epoch),
+                "SELECT count(*) AS lost FROM sandboxes "
+                " WHERE session_id = %s AND status IN ('dead','replaced')",
+                (session_id,),
             )
-            sandbox_id = cur.fetchone()["id"]
+            lost = cur.fetchone()["lost"]
 
-            sessions._emit(cur, session_id, "sandbox_spawning", {"epoch": epoch})
+            if lost >= config.MAX_SANDBOX_LOSSES:
+                # MAX_TOOL_ATTEMPTS cannot cover this: a sandbox dying before
+                # it claims anything never moves that counter.
+                failure = (
+                    f"gave up after losing {lost} sandboxes; "
+                    f"the last one because {reason or 'unknown'}"
+                )
+                sessions._set_status(cur, session_id, FAILED, failure)
+            else:
+                cur.execute(
+                    "UPDATE sessions SET current_epoch = current_epoch + 1, "
+                    "updated_at = now() WHERE id = %s RETURNING current_epoch",
+                    (session_id,),
+                )
+                epoch = cur.fetchone()["current_epoch"]
+                repo_url = row["repo_url"]
+                branch = row["branch"]
 
-    # TODO: handle a failed start. The runtime returns None, which strands the
-    # row at 'spawning' — a reaper that scans 'ready' rows with expired
-    # heartbeats will never see it. Decide between marking the sandbox 'dead'
-    # so the reaper retries it, and failing the session once spawn attempts
-    # hit a ceiling.
+                if reason is not None:
+                    # 'exited' is kept: that sandbox left rather than being
+                    # replaced, and overwriting it would read as a death.
+                    cur.execute(
+                        "UPDATE sandboxes SET status = 'replaced' "
+                        "WHERE session_id = %s AND epoch = %s AND status <> 'exited'",
+                        (session_id, previous),
+                    )
+                    sessions._emit(
+                        cur,
+                        session_id,
+                        "sandbox_died",
+                        {"epoch": previous, "reason": reason, "replaced_by": epoch},
+                    )
+
+                # Same transaction as the bump, so the replacement finds its
+                # work already waiting. The old sandbox cannot claim it back:
+                # its epoch is behind. A no-op on a first spawn.
+                rescued = sessions.rescue_orphaned_calls(cur, session_id)
+
+                cur.execute(
+                    "INSERT INTO sandboxes (session_id, epoch, status) "
+                    "VALUES (%s, %s, 'spawning') RETURNING id",
+                    (session_id, epoch),
+                )
+                sandbox_id = cur.fetchone()["id"]
+
+                sessions._emit(cur, session_id, "sandbox_spawning", {"epoch": epoch})
+
+                if rescued:
+                    logger.info(
+                        "session %s epoch %s inherits %s in-flight call(s): %s",
+                        session_id,
+                        epoch,
+                        len(rescued),
+                        ", ".join(c["name"] for c in rescued),
+                    )
+
+    if failure:
+        raise SpawnRefused(failure)
+
+    # TODO: a third runtime for a remote data plane — an HTTP call to a sandbox
+    # service that returns a handle. Same signature as the two below.
     #
-    # TODO: a third runtime, for a data plane that does not share a host with
-    # the control plane: an HTTP call to a remote sandbox service that returns
-    # a handle. Same signature as the two below.
+    # A failed start leaves the row at 'spawning', which
+    # SandboxNudge.reap_stuck_spawning replaces, bounded by MAX_SANDBOX_LOSSES.
     container_id = _start_sandbox(session_id, epoch, repo_url, branch)
     if container_id:
         with pool.connection() as conn:
@@ -110,22 +189,56 @@ def spawn(session_id: str) -> dict:
     }
 
 
+@log_context.correlated
+def ensure(session_id: str) -> dict | None:
+    """Guarantee the session has a sandbox. Returns a new one, or None.
+
+    The invariant anything about to give a session work depends on: tool calls
+    are only ever run by a sandbox, so a session without one has no way to
+    execute what a turn produces.
+
+    Called before advance rather than inside it, so the container boots while
+    the model thinks, and so a caller that already knows it has a sandbox can
+    skip the question.
+
+    No reason is passed to spawn, because nothing here died. A session arrives
+    with no sandbox because the last one left when the session went idle,
+    which is an ordinary end rather than a loss.
+    """
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT e.current_epoch, "
+            "       EXISTS (SELECT 1 FROM sandboxes s "
+            "                WHERE s.session_id = e.id "
+            "                  AND s.epoch = e.current_epoch "
+            "                  AND s.status = ANY(%s)) AS live "
+            "  FROM sessions e WHERE e.id = %s",
+            (list(LIVE_STATUSES), session_id),
+        ).fetchone()
+
+    if row is None:
+        raise SpawnRefused(f"no session {session_id}")
+    if row["live"]:
+        return None
+
+    # expect_epoch makes this exactly-once against every other caller doing
+    # the same thing, the same way replacement is.
+    logger.info("session %s has no sandbox; spawning one", session_id)
+    return spawn(session_id, expect_epoch=row["current_epoch"])
+
+
+@log_context.correlated
 def register(session_id: str, epoch: int, container_id: str | None = None) -> dict:
     """A sandbox announces itself. Returns what it needs to clone and check out.
 
-    Called once per epoch, either by the container spawn() started or by a
-    cursord run by hand against the same epoch. Re-registering is harmless:
-    a container that restarts inside its epoch lands on the same row.
+    Once per epoch, from the container spawn() started or a cursord run by
+    hand. Re-registering is harmless: it lands on the same row.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            current = sessions._require_current_epoch(cur, session_id, epoch)
-            if epoch > current:
-                # Not stale but nonsense: no sandbox exists at an epoch the
-                # session has not reached.
-                raise SpawnRefused(
-                    f"epoch {epoch} is ahead of session {session_id} at epoch {current}"
-                )
+            # Rejects both directions: a replaced sandbox, and an epoch the
+            # session never opened.
+            sessions._require_current_epoch(cur, session_id, epoch)
 
             cur.execute(
                 "SELECT repo_url, branch, base_sha, last_accepted_sha "
@@ -153,19 +266,18 @@ def register(session_id: str, epoch: int, container_id: str | None = None) -> di
     return {
         "repo_url": session["repo_url"],
         "branch": session["branch"],
-        # Null on a first spawn. Nothing here resolves it: the control plane
-        # runs no git at all, so the base is whatever the sandbox finds when
-        # it clones, and it comes back with the sandbox's first result. A
-        # rebuild reads it from here so its diff still starts where the work
-        # did rather than at the point it resumed from.
+        # Null on a first spawn: the control plane runs no git, so the base is
+        # whatever the sandbox finds and reports with its first result. A
+        # rebuild reads it back so its diff starts where the work did.
         "base_sha": session["base_sha"],
-        # A replacement resumes from the last SHA the control plane accepted,
-        # not from whatever the dead sandbox managed to push before it went.
+        # The last SHA the control plane accepted, not whatever the dead
+        # sandbox managed to push on its way out.
         "resume_sha": session["last_accepted_sha"],
         "epoch": epoch,
     }
 
 
+@log_context.correlated
 def heartbeat(
     session_id: str,
     epoch: int,
@@ -174,14 +286,11 @@ def heartbeat(
 ) -> dict:
     """Liveness, and the one place a sandbox announces its own shutdown.
 
-    A stale epoch raises, which is what tells a zombie to stop: it is the
-    only failure a sandbox is meant to die on, so nothing else in here may
-    surface as a 409.
+    A stale epoch raises, which is what tells a zombie to stop. It is the only
+    failure a sandbox should die on, so nothing else here may raise a 409.
 
-    Ordinary beats do not write to the event log. At one every three seconds
-    they would bury the transcript in noise that says nothing happened; the
-    timestamp on the row is the whole record. An exit is different, because
-    it happens once and explains why the sandbox stopped.
+    Ordinary beats write no event: the row timestamp is the whole record. An
+    exit does, because it happens once and says why the sandbox stopped.
     """
     if exiting:
         status = "exited" if reason in CLEAN_EXITS else "dead"
@@ -201,20 +310,17 @@ def heartbeat(
                  WHERE session_id = %s AND epoch = %s
                 RETURNING status
                 """,
-                # 'exited' is final. A beat still in flight when the container
-                # said goodbye must not land it back in the reaper's index,
-                # where a clean shutdown reads as a crash a threshold later.
+                # 'exited' is final: a beat still in flight when the container
+                # said goodbye must not put it back in the reaper's index.
                 #
-                # 'dead' is not final. A beat from a sandbox the reaper gave
-                # up on is proof the reaper was wrong, and the epoch check
-                # above means no replacement has taken over yet.
+                # 'dead' is not final: a beat proves the reaper wrong, and the
+                # epoch check above means no replacement has taken over.
                 (status, session_id, epoch),
             )
             row = cur.fetchone()
             if row is None:
                 # Not a 409: on this endpoint that means "you are stale, stop
-                # working", and a sandbox that never registered would take
-                # itself down for a reason that has nothing to do with it.
+                # working", which is the wrong instruction here.
                 raise SandboxNotRegistered(
                     f"session {session_id} has no sandbox at epoch {epoch}; "
                     "register before sending heartbeats"
@@ -247,16 +353,12 @@ def heartbeat(
 def _ssh_arguments() -> list:
     """Docker arguments giving the container git access to a real remote.
 
-    Known hosts are mounted in every mode. Without them `StrictHostKeyChecking
-    =yes` refuses the connection, and with checking turned off instead the
-    container would accept any host key for the remote it pushes to.
+    known_hosts is mounted in every mode: without it StrictHostKeyChecking
+    refuses the connection, and disabling checking would accept any host key.
     """
-    if config.SSH_MODE == "none":
-        return []
-
     if config.SSH_MODE == "keys":
-        # The whole directory, known_hosts included. The private key becomes
-        # readable by every command the model runs.
+        # The whole directory. The private key becomes readable by every
+        # command the model runs.
         logger.warning(
             "SANDBOX_SSH_MODE=keys mounts %s into a container that executes "
             "model-authored commands; the key is readable there",
@@ -275,8 +377,8 @@ def _ssh_arguments() -> list:
             "--volume", "{}:/root/.ssh/known_hosts:ro".format(known_hosts),
         ]
     else:
-        # Worth saying out loud: the failure is a clone that cannot verify the
-        # host, which reads as a permissions problem rather than a missing file.
+        # Said out loud because the failure surfaces as a clone that looks
+        # like a permissions problem rather than a missing file.
         logger.warning(
             "no known_hosts at %s; the container cannot verify the git remote. "
             "Run: ssh-keyscan github.com >> %s",
@@ -286,8 +388,8 @@ def _ssh_arguments() -> list:
 
     host_sock = _host_ssh_sock()
     if host_sock is None:
-        # Not fatal here: a clone from a reachable remote may still work, and
-        # failing the spawn would hide the real error behind a spawn refusal.
+        # Not fatal: a public remote may still clone, and refusing the spawn
+        # would hide the real error.
         logger.warning(
             "SANDBOX_SSH_MODE=agent but no ssh-agent socket found; "
             "the container will have no git credentials"
@@ -303,10 +405,9 @@ def _ssh_arguments() -> list:
 def _host_ssh_sock() -> Optional[str]:
     """The socket to forward, or None if the host has no agent running.
 
-    On Docker Desktop the host's `SSH_AUTH_SOCK` is not reachable from the
-    VM, so the fixed path it publishes is used instead. It only carries keys
-    the user has actually added, so `ssh-add` having been run is part of the
-    contract either way.
+    On Docker Desktop the host's SSH_AUTH_SOCK is unreachable from the VM, so
+    the fixed published path is used. Either way it only carries keys that
+    `ssh-add` has loaded.
     """
     if sys.platform == "darwin":
         return config.DESKTOP_SSH_SOCK
@@ -322,9 +423,9 @@ def _start_sandbox(
 ) -> Optional[str]:
     """Start cursord on whichever runtime is configured.
 
-    Every runtime has the same contract: hand cursord the five environment
-    values it demands, return a handle for the sandboxes row, and return None
-    rather than raise if it could not start.
+    Same contract for every runtime: pass cursord its five environment values,
+    return a handle for the sandboxes row, and return None rather than raise
+    if it could not start.
     """
     runtime = _RUNTIMES.get(config.SANDBOX_RUNTIME)
     if runtime is None:
@@ -341,8 +442,7 @@ def _cursord_env(
 ) -> dict:
     """The five values config.require() refuses to start without.
 
-    Shared by both runtimes so that adding one to the container and
-    forgetting it here is not a way to fail.
+    Shared by both runtimes so neither can drift from the other.
     """
     return {
         "SESSION_ID": session_id,
@@ -353,9 +453,9 @@ def _cursord_env(
     }
 
 
-# Popen objects for sandboxes this instance started, so an exited one is
-# waited on rather than left a zombie. Purely housekeeping: the handle in the
-# sandboxes row is a pid, so any instance can signal any sandbox without this.
+# Popen handles for sandboxes this instance started, so exited ones are waited
+# on rather than left as zombies. Housekeeping only: the sandboxes row holds a
+# pid, so any instance can signal any sandbox without this.
 _PROCESSES: dict = {}
 
 
@@ -371,11 +471,9 @@ def _start_process(
 ) -> Optional[str]:
     """Run cursord as a subprocess on this machine. Development only.
 
-    This is not a sandbox. run_command executes as this user, on this
-    filesystem, with this user's ssh keys and this user's access to the
-    control plane's own database. It exists so the loop can be driven
-    end-to-end against a local bare repo without Docker, and the model in
-    that setup is one you are watching.
+    Not a sandbox: run_command executes as this user, on this filesystem, with
+    this user's ssh keys and access to the control plane's own database. For
+    driving the loop end-to-end without Docker, under supervision.
     """
     _reap_exited()
 
@@ -385,8 +483,8 @@ def _start_process(
         )
         return None
 
-    # Per epoch, and cleared first: a rebuild must clone fresh, and prepare()
-    # clones into this path.
+    # Per epoch, cleared first: prepare() clones here and git refuses a
+    # non-empty directory.
     workspace = config.WORKSPACE_ROOT / session_id / str(epoch)
     shutil.rmtree(workspace, ignore_errors=True)
     workspace.parent.mkdir(parents=True, exist_ok=True)
@@ -398,9 +496,8 @@ def _start_process(
     env["WORKSPACE"] = str(workspace)
     env["PYTHONPATH"] = str(config.AGENT_DIR)
     env["PYTHONUNBUFFERED"] = "1"
-    # Same reasoning as the Dockerfile: without BatchMode a missing key or an
-    # unknown host becomes a prompt on a terminal nobody is attached to, and
-    # the clone hangs instead of failing with a reason.
+    # Without BatchMode a missing key or unknown host prompts on a terminal
+    # nobody is attached to, and the clone hangs instead of failing.
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
 
     config.LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -409,10 +506,10 @@ def _start_process(
     command = [
         "/bin/bash",
         "-c",
-        # $$ is this shell's pid and exec replaces the shell, so cursord runs
-        # as the pid recorded below and reports the same handle back from
-        # register(). Left alone it falls back to the machine hostname, which
-        # would overwrite the pid with a value nothing can signal.
+        # $$ is the shell's pid and exec replaces the shell, so cursord runs as
+        # the pid recorded below and reports the same handle from register().
+        # Otherwise it would report the machine hostname, which nothing can
+        # signal.
         'HOSTNAME="local:$$" exec "$0" -m cursord',
         sys.executable,
     ]
@@ -426,8 +523,8 @@ def _start_process(
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                # Its own session, so a control plane restart does not take
-                # the sandbox down with it.
+                # Its own session, so a control plane restart does not take the
+                # sandbox with it.
                 start_new_session=True,
             )
     except OSError as exc:
@@ -455,8 +552,8 @@ def _start_container(
 ) -> Optional[str]:
     """Run cursord in a container. Returns the container id, or None.
 
-    Returning None is not fatal: the sandbox row exists at this epoch, so a
-    cursord process started by hand can register against it.
+    None is not fatal: the sandbox row exists at this epoch, so a cursord
+    started by hand can register against it.
     """
     if not config.SANDBOX_IMAGE:
         logger.warning(
@@ -477,13 +574,8 @@ def _start_container(
     ).items():
         command += ["--env", "{}={}".format(name, value)]
 
-    if os.path.isdir(repo_url):
-        # The bare repo stands in for GitHub, so the container needs it mounted.
-        command += ["--volume", "{}:{}".format(repo_url, repo_url)]
-    else:
-        # Anything else is a real remote and needs credentials to read it,
-        # and the same credentials again to push every checkpoint.
-        command += _ssh_arguments()
+    # Credentials to clone the remote, and to push every checkpoint back.
+    command += _ssh_arguments()
 
     command.append(config.SANDBOX_IMAGE)
 

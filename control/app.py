@@ -1,18 +1,19 @@
 """HTTP surface for the control plane.
 
-Every handler is a short step of a state machine that lives in Postgres. No
-handler keeps anything in memory after it returns, so any instance can serve
-any request for any session.
+Each handler is one step of a state machine that lives in Postgres, and keeps
+nothing in memory after it returns, so any instance can serve any request.
 
-Handlers are plain `def`, not `async def`: the data layer is synchronous
-psycopg, so FastAPI runs each one in the threadpool and a request that parks
-on IO parks a thread rather than the event loop.
+Handlers are plain `def`: the data layer is synchronous psycopg, so FastAPI
+runs them in the threadpool and a request that parks on IO parks a thread
+rather than the event loop.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -23,16 +24,18 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import config
 import db
+import log_context
+import nudges
 import sandbox
 import sessions
 
-logging.basicConfig(level=logging.INFO)
+log_context.configure()
 
-# Each held long-poll occupies a thread for up to LONG_POLL_SECONDS, and every
-# advance() parks one for the length of the model call. Two polls per active
-# session means the stock 40 threads run out at ~20 sessions, and once they do
-# even fast requests queue behind them.
+# Every held long-poll and every advance() parks a thread. At two polls per
+# active session the stock 40 would run out around 20 sessions, after which
+# even fast requests queue.
 THREADPOOL_TOKENS = int(os.environ.get("THREADPOOL_TOKENS", "200"))
 
 
@@ -40,11 +43,43 @@ THREADPOOL_TOKENS = int(os.environ.get("THREADPOOL_TOKENS", "200"))
 async def lifespan(app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_TOKENS
     db.pool.wait(timeout=10)
+
+    # Sweep before serving: a restart is when sessions are most likely to be
+    # stranded. In a thread because a pass can spawn containers, and blocking
+    # the event loop would delay the health check.
+    stop = threading.Event()
+    await anyio.to_thread.run_sync(nudges.run_once)
+    nudger = threading.Thread(
+        target=nudges.run_forever, args=(stop,), name="nudger", daemon=True
+    )
+    nudger.start()
+
     yield
+
+    # One interval to notice. Daemon, so a pass in flight cannot hold us open.
+    stop.set()
+    nudger.join(timeout=config.NUDGE_INTERVAL_SECONDS)
     db.pool.close()
 
 
 app = FastAPI(title="cloud-agent", lifespan=lifespan)
+
+_SESSION_PATH = re.compile(r"/(?:sessions|sandbox)/([^/]+)")
+_ACTION_PATH = re.compile(r"/actions/([^/]+)")
+
+
+@app.middleware("http")
+async def correlate_request(request: Request, call_next):
+    """Put path identifiers on access and application logs for this request."""
+    session = _SESSION_PATH.search(request.url.path)
+    action = _ACTION_PATH.search(request.url.path)
+    epoch = request.query_params.get("epoch")
+    with log_context.bind(
+        session_id=session.group(1) if session else None,
+        action_id=action.group(1) if action else None,
+        epoch=int(epoch) if epoch and epoch.isdigit() else None,
+    ):
+        return await call_next(request)
 
 
 
@@ -121,9 +156,8 @@ class ActionResultRequest(BaseModel):
     result: Optional[str] = None
     exit_code: Optional[int] = None
     commit_sha: Optional[str] = None
-    # Git belongs to the data plane, so what the control plane knows about
-    # the diff is what the sandbox tells it. Bounded on both sides: a preview
-    # rather than the patch, and a stat rather than the file contents.
+    # Git lives in the data plane, so the diff summary is whatever the sandbox
+    # sends: a preview rather than the patch, a stat rather than contents.
     base_sha: Optional[str] = None
     diff_preview: Optional[str] = None
     diff_stat: Optional[dict] = None
@@ -131,8 +165,8 @@ class ActionResultRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     epoch: int
-    # A sandbox shutting down says so on its way out, so the reaper can tell
-    # a deliberate exit from a container that simply stopped answering.
+    # Set on the way out, so a deliberate exit is distinguishable from a
+    # container that simply stopped answering.
     exiting: bool = False
     reason: Optional[str] = None
 
@@ -148,8 +182,12 @@ def healthz() -> Dict[str, Any]:
 
 @app.post("/internal/reap")
 def reap() -> Dict[str, Any]:
-    """Respawn sandboxes with expired heartbeats. Driven by a timer."""
-    raise _not_built("sandbox.reap")
+    """Run one nudger pass now and report what it moved.
+
+    The same pass the daemon thread runs, exposed so recovery can be triggered
+    and inspected by hand.
+    """
+    return {"ok": True, **nudges.run_once()}
 
 
 
@@ -210,7 +248,7 @@ def get_next_action(session_id: str, epoch: int = Query(..., ge=0)) -> Dict[str,
     """Long-poll for the pending tool call.
 
     A null tool means the hold expired with nothing pending, unless
-    session_status is terminal, which means the sandbox should exit.
+    session_status is terminal, in which case the sandbox should exit.
     """
     return {"ok": True, **sessions.claim_next_action(session_id, epoch)}
 
@@ -253,13 +291,9 @@ def heartbeat(session_id: str, body: HeartbeatRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # the browser client
 #
-# Served from the control plane rather than a static server of its own, so the
-# page is same-origin with the API it calls. That is the whole reason: a client
-# on another origin would need CORS configured here and a preflight on every
-# request, to reach a service the browser is already talking to.
-#
-# Mounted last. A mount matches by prefix and would shadow any route declared
-# after it.
+# Served here so the page is same-origin with the API, avoiding CORS and a
+# preflight on every request. Mounted last: a mount matches by prefix and
+# would shadow any route declared after it.
 # ---------------------------------------------------------------------------
 CLIENT_DIR = Path(__file__).resolve().parent.parent / "client"
 

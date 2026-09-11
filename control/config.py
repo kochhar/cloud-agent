@@ -1,13 +1,10 @@
 """Every knob the control plane has, in one place.
 
-The server is started as a plain `uvicorn app:app`, with no shell step that
-sources .env, so the file is read here instead. Real environment variables
-always win: .env is the development default, not an override.
+.env is read here because the server starts as a plain `uvicorn app:app` with
+no shell step to source it. Real environment variables win.
 
-Modules import this and read `config.NAME` rather than binding the value at
-import time, so a test that reassigns one gets the behaviour it asked for.
-The exception is a default argument value, which Python evaluates once when
-the function is defined no matter how it is spelled.
+Read as `config.NAME` at call time so tests can reassign. Default argument
+values are the exception, since Python evaluates those once at definition.
 """
 
 from __future__ import annotations
@@ -52,46 +49,99 @@ def _flag(name: str, default: str) -> str:
 # ---------------------------------------------------------------------------
 # database
 # ---------------------------------------------------------------------------
+# libpq connection string.
 DATABASE_URL = _flag("DATABASE_URL", "postgresql://postgres@127.0.0.1:5432/project1")
 
 
 # ---------------------------------------------------------------------------
 # the model
 # ---------------------------------------------------------------------------
-# xAI speaks the OpenAI chat-completions dialect, so the path is the usual one.
+# Base URL of an OpenAI-compatible /chat/completions API.
 GROK_BASE_URL = _flag("GROK_BASE_URL", "https://api.x.ai/v1")
+
+# Unset means no provider: llm.use() has to install a client or turns fail.
 GROK_API_KEY: Optional[str] = os.environ.get("GROK_API_KEY") or None
+
 GROK_MODEL = _flag("GROK_MODEL", "grok-4.6")
 
-# A single turn can spend minutes reasoning before the first byte comes back,
-# and advance() holds no lock while it waits, so this is generous on purpose.
+# Seconds per HTTP attempt. advance() holds no lock while it waits, so a large
+# value costs a parked thread and nothing else.
 GROK_TIMEOUT_SECONDS = float(_flag("GROK_TIMEOUT", "300"))
+
+# Attempts per turn, including the first. With the timeout above, this sets
+# the worst case for one turn and therefore thinking_deadline().
 GROK_MAX_ATTEMPTS = int(_flag("GROK_MAX_ATTEMPTS", "4"))
 
 
 # ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
-# Shared by both long-polls: the events feed and the next-action poll. Held
-# under the usual 30s proxy timeout so a poll returns rather than resets.
+# Seconds a long-poll is held, on both the event feed and the next-action
+# poll. Keep below the proxy idle timeout (commonly 30) or polls are reset
+# rather than returned.
 LONG_POLL_SECONDS = float(_flag("LONG_POLL_SECONDS", "25"))
+
+# Seconds between database checks inside a held poll. Lower dispatches tool
+# calls sooner and costs more queries per waiting sandbox.
 POLL_INTERVAL_SECONDS = float(_flag("POLL_INTERVAL_SECONDS", "0.5"))
 
-# Each sandbox death re-dispatches the same call. Past this many attempts the
-# session fails rather than spawning containers forever.
+# Dispatches of a single tool call before the session fails. Counts sandbox
+# deaths, not command exit codes: a command that fails is a result, not a
+# retry.
 MAX_TOOL_ATTEMPTS = int(_flag("MAX_TOOL_ATTEMPTS", "3"))
 
-# Results reach the model in full and the UI truncated.
+
+# ---------------------------------------------------------------------------
+# the nudger
+# ---------------------------------------------------------------------------
+# Seconds between passes. A latency knob: passes are idempotent.
+NUDGE_INTERVAL_SECONDS = float(_flag("NUDGE_INTERVAL", "15"))
+
+# Seconds without a heartbeat before a 'ready' sandbox is replaced. Keep well
+# above cursord's HEARTBEAT_INTERVAL (10s), or one dropped beat replaces a
+# healthy sandbox.
+HEARTBEAT_DEATH_SECONDS = float(_flag("HEARTBEAT_DEATH", "30"))
+
+# Seconds at 'spawning' before the start counts as failed. Keep above
+# SPAWN_TIMEOUT_SECONDS, which bounds the runtime call itself.
+SPAWN_STUCK_SECONDS = float(_flag("SPAWN_STUCK", "120"))
+
+# Sandboxes a session may lose before it fails. Deaths only, so an ordinary
+# resume does not spend the budget.
+MAX_SANDBOX_LOSSES = int(_flag("MAX_SANDBOX_LOSSES", "10"))
+
+# Seconds before a nudge advances a turn nobody picked up. Only avoids racing
+# the caller that normally would.
+ADVANCE_GRACE_SECONDS = float(_flag("ADVANCE_GRACE", "30"))
+
+# Model calls one instance runs for the nudger at once, each holding a thread
+# for a whole turn. Sessions over the cap wait for a later pass.
+NUDGE_MAX_ADVANCES = int(_flag("NUDGE_MAX_ADVANCES", "8"))
+
+
+def thinking_deadline() -> float:
+    """Seconds 'thinking' may last before a nudge treats the call as lost.
+
+    Derived, not configured: too low and the nudge interrupts a live call and
+    runs the model twice on one context.
+    """
+    return GROK_TIMEOUT_SECONDS * GROK_MAX_ATTEMPTS + 120.0
+
+
+# ---------------------------------------------------------------------------
+# payload limits
+# ---------------------------------------------------------------------------
+# Chars of tool output put on the event feed. The model still gets the result
+# in full; this only bounds what the UI is sent.
 RESULT_PREVIEW_CHARS = int(_flag("RESULT_PREVIEW_CHARS", "2000"))
 
-# A patch is whatever the model wrote, so it has no bound worth storing in a
-# row that is rewritten on every commit. The sandbox sends a preview and a
-# per-file stat; this is the clamp applied to what arrives, independent of
-# the sandbox's own cap so a misbehaving one cannot grow the column.
+# Chars of patch kept in sessions.diff_preview, which is rewritten on every
+# commit. Applied to what the sandbox sends, so its own cap cannot grow this
+# column. The full patch stays in the repository.
 DIFF_PREVIEW_CHARS = int(_flag("DIFF_PREVIEW_CHARS", str(16 * 1024)))
 
-# Hosts whose web UI can render a two-dot compare, so the full patch has
-# somewhere to live that is not this database.
+# host -> two-dot compare URL template. A host that is absent here is not an
+# error; get_diff just returns url: null for it.
 COMPARE_URLS = {
     "github.com": "https://github.com/{repo}/compare/{base}...{head}",
     "gitlab.com": "https://gitlab.com/{repo}/-/compare/{base}...{head}",
@@ -105,22 +155,24 @@ COMPARE_URLS = {
 # Which runtime starts cursord:
 #
 #   docker   one container per epoch, from SANDBOX_IMAGE. The real thing.
-#   process  a plain subprocess on this machine. Development only, and
-#            emphatically not a sandbox: see sandbox._start_process.
+#   process  a plain subprocess on this machine. Development only, and not a
+#            sandbox: model-authored commands run as this user, with this
+#            user's filesystem, ssh keys and database access.
 SANDBOX_RUNTIME = _flag("SANDBOX_RUNTIME", "process")
 
+# Seconds to wait for the runtime to hand back a container id.
 SPAWN_TIMEOUT_SECONDS = float(_flag("SANDBOX_SPAWN_TIMEOUT", "60"))
 
 
 # ---------------------------------------------------------------------------
 # sandbox: docker runtime
 # ---------------------------------------------------------------------------
-# Without an image there is nothing to run; the sandbox row is still recorded
-# so a cursord started by hand can register against the epoch.
+# Empty means no container is started. The sandbox row is written anyway, so a
+# cursord started by hand can register against the epoch.
 SANDBOX_IMAGE = _flag("SANDBOX_IMAGE", "")
 
-# How the container reaches this control plane. On Docker Desktop the host is
-# not localhost from inside the container.
+# How the container reaches this control plane. Not localhost from inside a
+# container; on Docker Desktop the host is host.docker.internal.
 CONTROL_URL = _flag("SANDBOX_CONTROL_URL", "http://host.docker.internal:8000")
 
 
@@ -130,12 +182,12 @@ CONTROL_URL = _flag("SANDBOX_CONTROL_URL", "http://host.docker.internal:8000")
 # Where cursord is imported from, rather than baked into an image.
 AGENT_DIR = Path(_flag("SANDBOX_AGENT_DIR", str(ROOT / "agent")))
 
-# A local process reaches the control plane the ordinary way. host.docker
-# .internal does not resolve outside a container.
+# How a local subprocess reaches the control plane. host.docker.internal does
+# not resolve outside a container.
 LOCAL_CONTROL_URL = _flag("SANDBOX_LOCAL_CONTROL_URL", "http://127.0.0.1:8000")
 
-# One clone per epoch, never reused: workspace.prepare() clones into this path
-# and git refuses to clone into a directory that already has anything in it.
+# One clone per epoch, never reused: git refuses to clone into a non-empty
+# directory.
 WORKSPACE_ROOT = Path(
     _flag(
         "SANDBOX_WORKSPACE_ROOT",
@@ -143,8 +195,9 @@ WORKSPACE_ROOT = Path(
     )
 )
 
-# The container runtime keeps logs; a subprocess does not, and a cursord that
-# died on its first git call is otherwise silent.
+# Where a subprocess's stdout goes. A container runtime keeps its own logs; a
+# subprocess does not, and a cursord that died on its first git call is
+# otherwise silent.
 LOG_ROOT = Path(
     _flag("SANDBOX_LOG_ROOT", os.path.join(tempfile.gettempdir(), "cursord-logs"))
 )
@@ -153,23 +206,22 @@ LOG_ROOT = Path(
 # ---------------------------------------------------------------------------
 # sandbox: git credentials for the container
 # ---------------------------------------------------------------------------
-# How the container authenticates to a real git remote.
+# How the container authenticates to a git remote:
 #
 #   agent  forward the host's ssh-agent socket. The key never enters the
-#          container, so a model-authored `cat` cannot read it. The container
-#          can still *use* the key while it runs, which is unavoidable if it
-#          is to push at all.
-#   keys   bind-mount the key directory read-only. Simpler, and strictly
-#          worse: the private key is then a file inside a filesystem that
-#          arbitrary model-authored commands can read and exfiltrate. Only
-#          reasonable against a throwaway deploy key.
-#   none   no credentials. Correct for the local bare repo, which is reached
-#          by path rather than over the network.
+#          container, so a model-authored `cat` cannot read it, though the
+#          container can still use it while running.
+#   keys   bind-mount SSH_DIR read-only. The private key becomes a readable
+#          file in a filesystem where arbitrary model-authored commands run,
+#          so only reasonable with a throwaway deploy key.
+#
+# There is no credential-free mode: every repo is reached over the network and
+# a checkpoint is a push.
 SSH_MODE = _flag("SANDBOX_SSH_MODE", "agent")
 
 SSH_DIR = os.path.expanduser(_flag("SANDBOX_SSH_DIR", "~/.ssh"))
 
-# Docker Desktop exposes the host's agent at a fixed path inside the VM; there
-# is no host socket to bind directly. On Linux the host socket is the real one.
+# Docker Desktop exposes the host agent at a fixed path inside its VM; there is
+# no host socket to bind. On Linux the host socket is the real one.
 DESKTOP_SSH_SOCK = "/run/host-services/ssh-auth.sock"
 CONTAINER_SSH_SOCK = "/ssh-agent"
