@@ -139,7 +139,7 @@ def advance(sid):
 
 ### Epochs
 
-Each session has an integer epoch, incremented every time a sandbox is spawned for it. cursord receives its epoch at registration and includes it on every request. The control plane rejects any request carrying an epoch lower than the current one.
+Each session has an integer epoch, incremented every time a sandbox is spawned for it. cursord receives its epoch at registration and includes it on every request. The control plane rejects any request whose epoch is not exactly `current_epoch` — older and future values both fail.
 
 A zombie sandbox can therefore push commits to the branch, but its results are never accepted and it is never given more work. The branch is reconciled by resetting to the last SHA the control plane accepted.
 
@@ -149,7 +149,7 @@ The client has to see what the agent is doing as it happens. With no process hol
 
 ### Two tables
 
-`messages` is the model's context, rebuilt verbatim on every LLM call.
+`messages` is the model's context, rebuilt on every LLM call. A user message that lands mid-batch is held in that array until the tool replies close, so the provider never sees a user row splitting an assistant/tool pair. The log itself stays in arrival order.
 `events` is the UI feed.
 
 #### Differences
@@ -160,7 +160,9 @@ The client has to see what the agent is doing as it happens. With no process hol
 
 ### Event types
 
-`thinking`, `text`, `tool_started`, `tool_finished`, `status`, and the sandbox lifecycle set: `sandbox_spawning`, `sandbox_ready`, `sandbox_died`, `sandbox_replaced`, `sandbox_exited`.
+`thinking`, `text`, `status`, `tool_started`, `tool_finished`, `tool_requeued`, and the sandbox lifecycle set: `sandbox_spawning`, `sandbox_ready`, `sandbox_died`, `sandbox_exited`.
+
+There is no `sandbox_replaced` event. A replacement is already two events: `sandbox_died`, whose payload carries `replaced_by`, and `sandbox_spawning` for the epoch that took over.
 
 `sandbox_exited` is the ordinary end of a container's life and is kept apart from `sandbox_died` on purpose. A feed that reported a death every time a turn ended would train the reader to ignore the word.
 
@@ -180,7 +182,7 @@ Text and thinking are written as whole events when the LLM call returns.
 
 **Run.** Tools available to the model: read file, write file, list files, run command. The write path ends in a commit and a push when the tree is dirty.
 
-**Finish.** The model returns a response with no tool calls. The session is marked `idle` and the diff is read from the remote.
+**Finish.** The model returns a response with no tool calls. The session is marked `idle`. The diff the client reads is whatever the sandbox last reported onto the session row (`last_accepted_sha`, `diff_preview`, `diff_stat`); the full patch stays in the repository.
 
 `idle` is a resting state, not a closed one. The turn is over and the next move belongs to the user, which is a wait with no upper bound, so the sandbox does not sit through it: cursord sees `idle` on its poll, waits out a threshold of its own — five minutes in this build — and exits, reporting that it is going so the control plane can retire the row rather than wait for the heartbeat to go stale.
 
@@ -190,7 +192,7 @@ The threshold lives in the container because the container is what it spends. Th
 
 Only `failed` and `cancelled` close a session for good.
 
-**Sandbox dies.** cursord heartbeats every ten seconds. When heartbeats stop for longer than the threshold — thirty seconds, three missed beats — the session is marked `sandbox_dead` and a replacement is spawned at a new epoch.
+**Sandbox dies.** cursord heartbeats every ten seconds. When heartbeats stop for longer than the threshold — thirty seconds, three missed beats — the sandbox row is reaped and the client sees `sandbox_died`. The session stays `thinking` or `executing`. A replacement is spawned at a new epoch; in-flight tool calls are requeued (`tool_requeued`) and dispatched to it.
 
 The two numbers are one decision written in two places, and the threshold has to stay well above the interval. A threshold below three missed beats replaces sandboxes that are merely slow, and each wrong replacement re-runs the tool call the original was in the middle of. It clones, checks out the branch, and starts polling. Any pending tool call is still pending and gets dispatched to the new sandbox.
 
@@ -229,55 +231,62 @@ The two numbers are one decision written in two places, and the threshold has to
 
 ## Schema
 
+The live copy is `control/schema.sql`. Field names below match the columns.
+
 1. Sessions
-    1. Id – uuid, primary key
-    2. Repo_url, text
-    3. Branch, text
-    4. Base_sha, text
-    5. Last_accepted_sha, text
-    6. Status, enum
-        1. Idle — the turn ended; no sandbox, and the next move is the user's
-        2. Thinking
-        3. Executing
-        4. Failed
-        5. Cancelled
-    7. Epoch, int
-    8. Curr_message_seq, int
-    9. Curr_event_seq, int
-    10. Thinking_since, timestamp
-    11. Error, text
+    1. `id` – uuid, primary key
+    2. `repo_url`, text
+    3. `branch`, text
+    4. `base_sha`, text — where the sandbox's clone started
+    5. `last_accepted_sha`, text — newest SHA from a live epoch
+    6. `diff_preview`, text — bounded first slice of `base..head`
+    7. `diff_stat`, jsonb — per-file counts and totals
+    8. `status`, enum
+        1. `idle` — the turn ended; no sandbox, and the next move is the user's
+        2. `thinking` — an instance is inside the LLM call
+        3. `executing` — tool calls outstanding
+        4. `failed`
+        5. `cancelled`
+    9. `current_epoch`, int
+    10. `message_seq`, int
+    11. `event_seq`, int
+    12. `thinking_since`, timestamp — set on entry to `thinking`
+    13. `error`, text
 2. Sandboxes
-    1. Id, uuid, primary key
-    2. Session_id, uuid, foreign key
-    3. Epoch, int
-    4. Container_id, int
-    5. Status, text — spawning, ready, dead, replaced, exited
-    6. Last_heartbeat_at, timestamp
+    1. `id`, uuid, primary key
+    2. `session_id`, uuid, foreign key
+    3. `epoch`, int
+    4. `container_id`, text — docker id, null until spawned
+    5. `status`, text — `spawning`, `ready`, `dead`, `replaced`, `exited`
+    6. `last_heartbeat_at`, timestamp
 3. Messages
-    1. Id, uuid primary key
-    2. Session_id, uuid, foreign key
-    3. Seq, int
-    4. Role, text (system, user, tool, agent)
-    5. Content, text
-    6. Thinking, text
-    7. Tool-calls, jsonb
-4. Tools
-    1. Id, uuid primary key
-    2. Session_id, uuid, foreign key
-    3. Message_id, uuid, foreign key
-    4. Name, text
-    5. Args, jsonb
-    6. Status, enum ('pending', 'dispatched', 'complete', 'failed')
-    7. Epoch, int — which sandbox epoch executed this tool
-    8. Attempts, int — for giving up after 3 attempts
-    9. Result, text
-    10. Exit_code, int
-    11. Commit_sha, text, could be null if the tool didn't make any changes
-    12. Dispatched_at, timestamp
+    1. `id`, uuid, primary key
+    2. `session_id`, uuid, foreign key
+    3. `seq`, int — from `sessions.message_seq`
+    4. `role`, text — `system`, `user`, `assistant`, `tool`
+    5. `content`, text — null on a pure tool-call turn
+    6. `reasoning`, text — thinking, if the API returns it
+    7. `tool_calls`, jsonb — assistant rows, the provider array verbatim
+    8. `provider_call_id`, text — tool rows, which provider call this answers
+4. Tool calls
+    1. `id`, uuid, primary key — the `action_id` in the API
+    2. `session_id`, uuid, foreign key
+    3. `message_id`, uuid, foreign key
+    4. `provider_call_id`, text
+    5. `name`, text
+    6. `args`, jsonb
+    7. `ordinal`, int — dispatch order within the batch
+    8. `status`, enum — `pending`, `dispatched`, `done`, `failed`
+    9. `epoch`, int — which sandbox epoch this call went to
+    10. `attempts`, int — dispatches before giving up
+    11. `result`, text
+    12. `exit_code`, int
+    13. `commit_sha`, text — null when the tree was clean
+    14. `repeated`, boolean — re-dispatched after a death
+    15. `dispatched_at`, timestamp
+    16. `completed_at`, timestamp
 5. Events
-    1. Id, uuid, primary key
-    2. Session_id, uuid, foreign key
-    3. Seq, int
-    4. Role, text (System, user, tool, agent)
-    5. Kind, text (content, thinking)
-    6. Payload, jsonb
+    1. `session_id`, uuid, foreign key
+    2. `seq`, int — from `sessions.event_seq`; primary key is `(session_id, seq)`
+    3. `type`, text — `thinking`, `text`, `status`, `tool_started`, `tool_finished`, `tool_requeued`, `sandbox_spawning`, `sandbox_ready`, `sandbox_died`, `sandbox_exited`
+    4. `payload`, jsonb

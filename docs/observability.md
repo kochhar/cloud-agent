@@ -43,8 +43,8 @@ PYTHONPATH=. .venv/bin/uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8001
 ```
 
-Open <http://127.0.0.1:8001/ui/>. The JSON snapshot is
-`GET /api/overview?hours=24`; accepted windows are 1 through 168 hours.
+Open <http://127.0.0.1:8001/>. The JSON snapshot is a sibling of that page:
+`GET /api/overview?hours=24`. Accepted windows are 1 through 168 hours.
 
 Configuration:
 
@@ -124,12 +124,20 @@ DELETE FROM llm_attempts
 ## Deployment
 
 The dashboard and control are separate failure and scaling domains. If one
-browser origin is required, route them through a reverse proxy:
+browser origin is required, route them through a reverse proxy. The cluster
+script does this as:
 
 ```text
-/api/*  -> control
-/ops/*  -> dashboard
+/api/*          -> control
+/ui/*           -> control session client
+/ops/dash/api/* -> dashboard JSON
+/ops/dash/*     -> dashboard UI
 ```
+
+The dashboard page fetches `api/overview` as a relative URL, so it stays
+under whatever prefix served the page. Standalone that is `/api/overview`.
+Behind the proxy it is `/ops/dash/api/overview`. An origin-absolute
+`/api/overview` would hit control.
 
 The dashboard exposes only fixed aggregations. It has no arbitrary SQL
 endpoint, uses a small pool, bounds the time window, caches snapshots, and

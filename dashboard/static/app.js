@@ -146,7 +146,7 @@ function render(data) {
 
 async function load() {
   try {
-    const response = await fetch(`/api/overview?hours=${$("window").value}`);
+    const response = await fetch(`api/overview?hours=${$("window").value}`);
     if (!response.ok) throw new Error(`Dashboard API returned ${response.status}`);
     render(await response.json());
     $("error").hidden = true;

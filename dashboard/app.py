@@ -56,12 +56,16 @@ def create_app(db_pool=pool, collector=queries.collect_overview) -> FastAPI:
             cache[hours] = (time.monotonic(), snapshot)
         return snapshot
 
-    @application.get("/", include_in_schema=False)
-    def index() -> RedirectResponse:
-        return RedirectResponse("/ui/")
+    @application.get("/ui", include_in_schema=False)
+    @application.get("/ui/", include_in_schema=False)
+    def legacy_ui() -> RedirectResponse:
+        return RedirectResponse("/")
 
+    # Mounted last so /api and /healthz keep matching. The page and the JSON
+    # are siblings: / and /api/overview, the same shape Nginx exposes under
+    # /ops/dash/.
     application.mount(
-        "/ui", StaticFiles(directory=STATIC_DIR, html=True), name="dashboard"
+        "/", StaticFiles(directory=STATIC_DIR, html=True), name="dashboard"
     )
     return application
 

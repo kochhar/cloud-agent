@@ -179,6 +179,7 @@ class DashboardIntegrationTests(unittest.TestCase):
                 data["tiles"]["cost"]["cost_per_completed_turn_usd"], 0.03
             )
             self.assertEqual(client.get("/healthz").status_code, 200)
+            self.assertEqual(client.get("/").status_code, 200)
             self.assertEqual(client.get("/api/overview?hours=169").status_code, 422)
 
 
