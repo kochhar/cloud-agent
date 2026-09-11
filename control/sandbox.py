@@ -65,8 +65,6 @@ def spawn(
     `reason` is why the previous sandbox is being replaced, recorded on the
     event feed. None for a first spawn.
     """
-    # Set when the epoch ceiling is hit. The write goes inside the transaction
-    # and the raise waits until after the commit that would roll it back.
     failure: str | None = None
     epoch = repo_url = branch = sandbox_id = None
 
@@ -94,16 +92,15 @@ def spawn(
                     "another instance replaced it first"
                 )
 
-            # The ceiling counts sandboxes that were lost, not epochs. An
-            # ordinary resume opens an epoch too, so counting epochs would
-            # fail a healthy conversation for having had gaps in it.
+            # The ceiling counts lost sandboxes, not epochs. Ordinary resumes
+            # open an epoch too, so counting epochs would fail a conversation 
+            # for having gaps.
             cur.execute(
                 "SELECT count(*) AS lost FROM sandboxes "
                 " WHERE session_id = %s AND status IN ('dead','replaced')",
                 (session_id,),
             )
             lost = cur.fetchone()["lost"]
-
             if lost >= config.MAX_SANDBOX_LOSSES:
                 # MAX_TOOL_ATTEMPTS cannot cover this: a sandbox dying before
                 # it claims anything never moves that counter.
@@ -113,6 +110,7 @@ def spawn(
                 )
                 sessions._set_status(cur, session_id, FAILED, failure)
             else:
+                # Bump the epoch and update the session row.
                 cur.execute(
                     "UPDATE sessions SET current_epoch = current_epoch + 1, "
                     "updated_at = now() WHERE id = %s RETURNING current_epoch",
@@ -122,13 +120,11 @@ def spawn(
                 repo_url = row["repo_url"]
                 branch = row["branch"]
 
-                # Always mark the previous epoch's live row replaced. ensure
-                # and spawn_for_pending pass no reason, and without this a
-                # ready row that registers in the window between ensure's
-                # liveness read and this lock stays 'ready' at a stale epoch
-                # forever: heartbeats 409, no nudge matches it.
-                # 'exited' is kept: that sandbox left rather than being
-                # replaced, and overwriting it would read as a death.
+                # Mark the previous epoch's live row replaced. without this a
+                # ready row that registers in the window between ensure's liveness 
+                # read and this lock stays 'ready' at a stale epoch forever: heartbeats
+                # 409, no nudge matches it. 'exited' is kept: that sandbox left rather 
+                # than being replaced, and overwriting it would read as a death.
                 cur.execute(
                     "UPDATE sandboxes SET status = 'replaced' "
                     "WHERE session_id = %s AND epoch = %s AND status <> 'exited'",
@@ -153,7 +149,6 @@ def spawn(
                     (session_id, epoch),
                 )
                 sandbox_id = cur.fetchone()["id"]
-
                 sessions._emit(cur, session_id, "sandbox_spawning", {"epoch": epoch})
 
                 if rescued:
@@ -164,7 +159,9 @@ def spawn(
                         len(rescued),
                         ", ".join(c["name"] for c in rescued),
                     )
-
+    
+    # this needs to be kept outside the transaction so that 
+    # the raise can be delayed until after the commit that would roll it back.
     if failure:
         raise SpawnRefused(failure)
 
@@ -193,17 +190,8 @@ def spawn(
 def ensure(session_id: str) -> dict | None:
     """Guarantee the session has a sandbox. Returns a new one, or None.
 
-    The invariant anything about to give a session work depends on: tool calls
-    are only ever run by a sandbox, so a session without one has no way to
-    execute what a turn produces.
-
-    Called before advance rather than inside it, so the container boots while
-    the model thinks, and so a caller that already knows it has a sandbox can
-    skip the question.
-
-    No reason is passed to spawn, because nothing here died. A session arrives
-    with no sandbox because the last one left when the session went idle,
-    which is an ordinary end rather than a loss.
+    Called before advance so the container boots while the model thinks, 
+    and so a caller that already knows it has a sandbox can skip.
     """
     with pool.connection() as conn:
         row = conn.execute(

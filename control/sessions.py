@@ -789,10 +789,11 @@ def _claim_one_action(
 
     Returns the session status too, so the caller can tell "nothing pending
     yet" from "nothing will ever be pending". The session row is locked
-    first so this cannot deadlock with spawn's rescue. SKIP LOCKED is how
-    two waiters on the same session pick different pending rows once they
-    have the session in turn. RETURNING names columns the way the sandbox
-    reads them, so the claimed row is the response body.
+    first so this cannot deadlock with spawn's rescue. A second sandbox on
+    the same session is a zombie and fails the epoch check before this
+    statement; two waiters never sit inside the UPDATE together.
+    RETURNING names columns the way the sandbox reads them, so the claimed
+    row is the response body.
 
     The third value is whether this claim closed the batch: a call that
     hits MAX_TOOL_ATTEMPTS is failed rather than handed out, and if it was
@@ -804,9 +805,6 @@ def _claim_one_action(
         with conn.cursor() as cur:
             status = _require_current(cur, session_id, epoch)["status"]
             if status in TERMINAL_STATUSES:
-                # A cancelled session can still hold pending rows, and their
-                # results would never be accepted.
-                return status, None, False
                 # A cancelled session can still hold pending rows, and their
                 # results would never be accepted.
                 return status, None, False
@@ -826,8 +824,7 @@ def _claim_one_action(
                         -- created_at ties across a batch (it defaults to the
                         -- transaction clock), so ordinal breaks it.
                         ORDER BY created_at, ordinal
-                        LIMIT 1
-                          FOR UPDATE SKIP LOCKED)
+                        LIMIT 1)
                 RETURNING id AS action_id, name, args, attempts AS attempt,
                           repeated, message_id
                 """,
