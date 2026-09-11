@@ -170,6 +170,7 @@ def collect_overview(conn, hours: int) -> dict:
     queue = conn.execute(
         """
         SELECT count(*) FILTER (WHERE status = 'pending') AS pending_count,
+               count(*) FILTER (WHERE status = 'dispatched') AS dispatched_count,
                count(*) FILTER (
                    WHERE status = 'pending' AND attempts = 0
                ) AS never_dispatched_count,
@@ -291,6 +292,23 @@ def collect_overview(conn, hours: int) -> dict:
         (hours,),
     ).fetchone()
 
+    heartbeats = conn.execute(
+        """
+        SELECT count(*) FILTER (
+                   WHERE status = 'ready'
+                     AND last_heartbeat_at >=
+                         now() - (%s * interval '1 second')
+               ) AS live,
+               count(*) FILTER (WHERE status = 'ready') AS ready,
+               count(*) FILTER (WHERE status = 'spawning') AS spawning,
+               extract(epoch FROM (now() - min(last_heartbeat_at) FILTER (
+                   WHERE status = 'ready'
+               ))) AS oldest_ready_heartbeat_seconds
+          FROM sandboxes
+        """,
+        (config.HEARTBEAT_DEATH_SECONDS,),
+    ).fetchone()
+
     health = conn.execute(
         """
         SELECT coalesce(max(current_epoch), 0) AS epoch_high_water,
@@ -343,8 +361,8 @@ def collect_overview(conn, hours: int) -> dict:
             "queue": {
                 **_row_numbers(queue),
                 "definition": (
-                    "Exact age covers pending calls that have never been "
-                    "dispatched; requeued calls have no pending_since field."
+                    "Open tool_calls in pending, plus those already handed to "
+                    "a sandbox. Oldest age covers never-dispatched calls only."
                 ),
             },
             "recovery": {
@@ -393,6 +411,19 @@ def collect_overview(conn, hours: int) -> dict:
         "secondary": {
             "latency": _row_numbers(latency),
             "spawn": _row_numbers(spawn),
+            "heartbeats": {
+                **_row_numbers(heartbeats),
+                "stale_ready": (
+                    heartbeats["ready"] - heartbeats["live"]
+                    if heartbeats["ready"] is not None
+                    else 0
+                ),
+                "death_threshold_seconds": config.HEARTBEAT_DEATH_SECONDS,
+                "definition": (
+                    "Ready sandboxes whose last heartbeat is inside the "
+                    "reaper death threshold."
+                ),
+            },
             "loop_health": _row_numbers(health),
         },
     }

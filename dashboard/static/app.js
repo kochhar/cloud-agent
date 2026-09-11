@@ -31,9 +31,14 @@ function sparkline(series) {
   }</div>`;
 }
 
+function panel(source, fallback = {}) {
+  return source && typeof source === "object" ? source : fallback;
+}
+
 function render(data) {
-  const tiles = data.tiles;
-  const activity = tiles.activity;
+  const tiles = panel(data.tiles);
+  const secondary = panel(data.secondary);
+  const activity = panel(tiles.activity);
   $("activity").innerHTML = `${head(1, "Activity and outcomes")}
     <div class="stats">
       <div class="stat"><span>Sessions started</span><strong>${rate(activity.sessions_started_per_hour)}</strong></div>
@@ -44,7 +49,7 @@ function render(data) {
     ${sparkline(activity.series)}
     <p class="definition">${activity.definition}</p>`;
 
-  const states = tiles.active_states.states;
+  const states = panel(tiles.active_states).states || [];
   const total = states.reduce((sum, row) => sum + row.count, 0);
   $("active-states").innerHTML = `${head(2, "Active sessions by state")}
     <div class="metric">${number(total)}</div>
@@ -55,19 +60,20 @@ function render(data) {
     <p class="definition">${tiles.active_states.definition}</p>`;
 
   $("turn-duration").innerHTML = unavailable(
-    3, "End-to-end turn duration", tiles.turn_duration.reason
+    3, "End-to-end turn duration", panel(tiles.turn_duration).reason
   );
 
-  const queue = tiles.queue;
-  $("queue").innerHTML = `${head(4, "Oldest pending action")}
-    <div class="metric">${duration(queue.oldest_never_dispatched_seconds)}</div>
+  const queue = panel(tiles.queue);
+  $("queue").innerHTML = `${head(4, "Pending actions")}
+    <div class="metric">${number(queue.pending_count)}</div>
     <div class="stats">
-      <div class="stat"><span>All pending</span><strong>${number(queue.pending_count)}</strong></div>
+      <div class="stat"><span>Dispatched</span><strong>${number(queue.dispatched_count)}</strong></div>
       <div class="stat"><span>Never dispatched</span><strong>${number(queue.never_dispatched_count)}</strong></div>
+      <div class="stat"><span>Oldest never dispatched</span><strong>${duration(queue.oldest_never_dispatched_seconds)}</strong></div>
     </div>
-    <p class="definition">${queue.definition}</p>`;
+    <p class="definition">${queue.definition || "Open tool_calls still waiting to run."}</p>`;
 
-  const recovery = tiles.recovery;
+  const recovery = panel(tiles.recovery);
   $("recovery").innerHTML = `${head(5, "Sandbox recovery")}
     <div class="stats">
       <div class="stat"><span>Deaths / hour</span><strong>${rate(recovery.deaths_per_hour)}</strong></div>
@@ -78,13 +84,13 @@ function render(data) {
       number(recovery.recovered_sessions + recovery.failed_sessions)
     }.</p>`;
 
-  const llm = tiles.llm;
+  const llm = panel(tiles.llm);
   if (!llm.available) {
     $("llm").innerHTML = unavailable(
       6, "LLM p95 and error rate", "No completed model attempts in this window."
     );
   } else {
-    const causes = llm.errors.length
+    const causes = (llm.errors || []).length
       ? llm.errors.map((row) => `${row.outcome}: ${row.count}`).join(" · ")
       : "No errors";
     $("llm").innerHTML = `${head(6, "LLM p95 and error rate")}
@@ -96,7 +102,7 @@ function render(data) {
       <p class="definition">${causes}. ${llm.definition} In flight: ${number(llm.in_flight)}; stale: ${number(llm.stale_in_flight)}.</p>`;
   }
 
-  const cost = tiles.cost;
+  const cost = panel(tiles.cost);
   if (!cost.available) {
     $("cost").innerHTML = unavailable(7, "Cost per completed turn", cost.reason);
   } else {
@@ -109,7 +115,7 @@ function render(data) {
       <p class="definition">${cost.definition}</p>`;
   }
 
-  const repeat = tiles.reexecution;
+  const repeat = panel(tiles.reexecution);
   $("reexecution").innerHTML = `${head(8, "Re-execution rate")}
     <div class="metric">${percent(repeat.rate)}</div>
     <div class="stats">
@@ -118,9 +124,10 @@ function render(data) {
     </div>
     <p class="definition">${repeat.definition}</p>`;
 
-  const latency = data.secondary.latency;
-  const spawn = data.secondary.spawn;
-  const loop = data.secondary.loop_health;
+  const latency = panel(secondary.latency);
+  const spawn = panel(secondary.spawn);
+  const beats = panel(secondary.heartbeats);
+  const loop = panel(secondary.loop_health);
   $("secondary-grid").innerHTML = `
     <article class="detail"><h3>Dispatch and result latency</h3><dl>
       <dt>Insert → first dispatch p50</dt><dd>${duration(latency.dispatch_p50_seconds)}</dd>
@@ -133,6 +140,13 @@ function render(data) {
       <dt>Row → ready p50</dt><dd>${duration(spawn.p50_seconds)}</dd>
       <dt>Row → ready p95</dt><dd>${duration(spawn.p95_seconds)}</dd>
       <dt>Samples</dt><dd>${number(spawn.samples)}</dd>
+    </dl></article>
+    <article class="detail"><h3>Live heartbeats</h3><dl>
+      <dt>Pinging now</dt><dd>${number(beats.live)}</dd>
+      <dt>Ready but stale</dt><dd>${number(beats.stale_ready)}</dd>
+      <dt>Still spawning</dt><dd>${number(beats.spawning)}</dd>
+      <dt>Oldest ready beat</dt><dd>${duration(beats.oldest_ready_heartbeat_seconds)}</dd>
+      <dt>Pending actions</dt><dd>${number(queue.pending_count)}</dd>
     </dl></article>
     <article class="detail"><h3>Loop health</h3><dl>
       <dt>Epoch high-water</dt><dd>${number(loop.epoch_high_water)}</dd>

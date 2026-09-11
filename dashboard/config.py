@@ -46,3 +46,6 @@ INPUT_COST_PER_MILLION = float(os.environ.get("GROK_INPUT_COST_PER_MILLION", "2"
 OUTPUT_COST_PER_MILLION = float(os.environ.get("GROK_OUTPUT_COST_PER_MILLION", "6"))
 LONG_CONTEXT_TOKENS = int(os.environ.get("GROK_LONG_CONTEXT_TOKENS", "200000"))
 LONG_CONTEXT_MULTIPLIER = float(os.environ.get("GROK_LONG_CONTEXT_MULTIPLIER", "2"))
+
+# Same threshold the reaper uses: a ready sandbox older than this is dead.
+HEARTBEAT_DEATH_SECONDS = float(os.environ.get("HEARTBEAT_DEATH", "30"))

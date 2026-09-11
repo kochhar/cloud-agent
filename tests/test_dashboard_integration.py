@@ -88,10 +88,13 @@ class DashboardIntegrationTests(unittest.TestCase):
             """
             INSERT INTO sandboxes
                 (session_id, epoch, status, created_at, last_heartbeat_at)
-            VALUES (%s, 1, 'replaced', now() - interval '51 minutes',
-                    now() - interval '50 minutes')
+            VALUES
+                (%s, 1, 'replaced', now() - interval '51 minutes',
+                 now() - interval '50 minutes'),
+                (%s, 2, 'ready', now() - interval '10 minutes', now() - interval '5 seconds'),
+                (%s, 2, 'ready', now() - interval '10 minutes', now() - interval '2 minutes')
             """,
-            (recovered,),
+            (recovered, pending, failed),
         )
 
         message_ids = []
@@ -160,6 +163,8 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertEqual(data["tiles"]["activity"]["turns_completed"], 1)
             self.assertEqual(data["tiles"]["activity"]["turns_failed"], 1)
             self.assertEqual(data["tiles"]["activity"]["completion_rate"], 0.5)
+            self.assertEqual(data["tiles"]["queue"]["pending_count"], 1)
+            self.assertEqual(data["tiles"]["queue"]["dispatched_count"], 0)
             self.assertEqual(data["tiles"]["queue"]["never_dispatched_count"], 1)
             self.assertGreater(
                 data["tiles"]["queue"]["oldest_never_dispatched_seconds"], 800
@@ -178,6 +183,9 @@ class DashboardIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(
                 data["tiles"]["cost"]["cost_per_completed_turn_usd"], 0.0026
             )
+            self.assertEqual(data["secondary"]["heartbeats"]["live"], 1)
+            self.assertEqual(data["secondary"]["heartbeats"]["ready"], 2)
+            self.assertEqual(data["secondary"]["heartbeats"]["stale_ready"], 1)
             self.assertEqual(client.get("/healthz").status_code, 200)
             self.assertEqual(client.get("/").status_code, 200)
             self.assertEqual(client.get("/api/overview?hours=169").status_code, 422)

@@ -104,8 +104,10 @@ All values use the selected dashboard window unless noted otherwise.
    one dispatch.
 
 Secondary panels report first-dispatch latency, control-observed
-dispatch-to-result latency, sandbox row-to-ready latency, epoch high-water
-mark, oldest thinking age, and executing sessions with no open tool call.
+dispatch-to-result latency, sandbox row-to-ready latency, live heartbeats
+(ready sandboxes whose last beat is inside `HEARTBEAT_DEATH`), epoch
+high-water mark, oldest thinking age, and executing sessions with no open
+tool call.
 “Dispatch to result” includes daemon execution, checkpoint/push, and HTTP
 reporting; it is not labeled as pure tool execution.
 

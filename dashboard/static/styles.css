@@ -120,7 +120,7 @@ select {
 }
 
 .secondary { margin: 44px 0 70px; }
-.secondary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+.secondary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
 .detail { padding: 18px; border-top: 1px solid var(--line); background: rgba(18, 23, 32, .5); }
 .detail dl { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin: 14px 0 0; }
 .detail dt { color: var(--muted); }
