@@ -13,45 +13,13 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Any, Optional
+from typing import Optional
 
+import config
 import sessions
 from db import pool
 
 logger = logging.getLogger(__name__)
-
-# Without an image there is nothing to run; the sandbox row is still recorded
-# so a cursord started by hand can register against the epoch.
-SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "")
-
-# How the container reaches this control plane. On Docker Desktop the host is
-# not localhost from inside the container.
-CONTROL_URL = os.environ.get("SANDBOX_CONTROL_URL", "http://host.docker.internal:8000")
-
-SPAWN_TIMEOUT_SECONDS = float(os.environ.get("SANDBOX_SPAWN_TIMEOUT", "60"))
-
-GIT_TIMEOUT_SECONDS = float(os.environ.get("SANDBOX_GIT_TIMEOUT", "30"))
-
-# How the container authenticates to a real git remote.
-#
-#   agent  forward the host's ssh-agent socket. The key never enters the
-#          container, so a model-authored `cat` cannot read it. The container
-#          can still *use* the key while it runs, which is unavoidable if it
-#          is to push at all.
-#   keys   bind-mount the key directory read-only. Simpler, and strictly
-#          worse: the private key is then a file inside a filesystem that
-#          arbitrary model-authored commands can read and exfiltrate. Only
-#          reasonable against a throwaway deploy key.
-#   none   no credentials. Correct for the local bare repo, which is reached
-#          by path rather than over the network.
-SSH_MODE = os.environ.get("SANDBOX_SSH_MODE", "agent")
-
-SSH_DIR = os.path.expanduser(os.environ.get("SANDBOX_SSH_DIR", "~/.ssh"))
-
-# Docker Desktop exposes the host's agent at a fixed path inside the VM; there
-# is no host socket to bind directly. On Linux the host socket is the real one.
-DESKTOP_SSH_SOCK = "/run/host-services/ssh-auth.sock"
-CONTAINER_SSH_SOCK = "/ssh-agent"
 
 
 class SpawnRefused(Exception):
@@ -98,17 +66,16 @@ def spawn(session_id: str) -> dict:
 
             sessions._emit(cur, session_id, "sandbox_spawning", {"epoch": epoch})
 
-    # TODO: handle a failed container start. _start_container returns None,
-    # which strands the row at 'spawning' — a reaper that scans 'ready' rows
-    # with expired heartbeats will never see it. Decide between marking the
-    # sandbox 'dead' so the reaper retries it, and failing the session once
-    # spawn attempts hit a ceiling.
+    # TODO: handle a failed start. The runtime returns None, which strands the
+    # row at 'spawning' — a reaper that scans 'ready' rows with expired
+    # heartbeats will never see it. Decide between marking the sandbox 'dead'
+    # so the reaper retries it, and failing the session once spawn attempts
+    # hit a ceiling.
     #
-    # TODO: make the runtime an interface rather than a function. `docker run`
-    # only works while the data plane shares a host with the control plane.
-    # Same signature, two implementations behind a config switch: local docker,
-    # and an HTTP call to a remote sandbox service that returns a container id.
-    container_id = _start_container(session_id, epoch, repo_url, branch)
+    # TODO: a third runtime, for a data plane that does not share a host with
+    # the control plane: an HTTP call to a remote sandbox service that returns
+    # a handle. Same signature as the two below.
+    container_id = _start_sandbox(session_id, epoch, repo_url, branch)
     if container_id:
         with pool.connection() as conn:
             conn.execute(
@@ -198,7 +165,7 @@ def _resolve_base_sha(repo_url: str) -> Optional[str]:
             capture_output=True,
             text=True,
             check=True,
-            timeout=GIT_TIMEOUT_SECONDS,
+            timeout=config.GIT_TIMEOUT_SECONDS,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         # Not fatal: registration still succeeds, but the diff will be empty
@@ -221,25 +188,25 @@ def _ssh_arguments() -> list:
     =yes` refuses the connection, and with checking turned off instead the
     container would accept any host key for the remote it pushes to.
     """
-    if SSH_MODE == "none":
+    if config.SSH_MODE == "none":
         return []
 
-    if SSH_MODE == "keys":
+    if config.SSH_MODE == "keys":
         # The whole directory, known_hosts included. The private key becomes
         # readable by every command the model runs.
         logger.warning(
             "SANDBOX_SSH_MODE=keys mounts %s into a container that executes "
             "model-authored commands; the key is readable there",
-            SSH_DIR,
+            config.SSH_DIR,
         )
-        return ["--volume", "{}:/root/.ssh:ro".format(SSH_DIR)]
+        return ["--volume", "{}:/root/.ssh:ro".format(config.SSH_DIR)]
 
-    if SSH_MODE != "agent":
-        raise ValueError("unknown SANDBOX_SSH_MODE {!r}".format(SSH_MODE))
+    if config.SSH_MODE != "agent":
+        raise ValueError("unknown SANDBOX_SSH_MODE {!r}".format(config.SSH_MODE))
 
     arguments = []
 
-    known_hosts = os.path.join(SSH_DIR, "known_hosts")
+    known_hosts = os.path.join(config.SSH_DIR, "known_hosts")
     if os.path.isfile(known_hosts):
         arguments += [
             "--volume", "{}:/root/.ssh/known_hosts:ro".format(known_hosts),
@@ -265,8 +232,8 @@ def _ssh_arguments() -> list:
         return arguments
 
     return arguments + [
-        "--volume", "{}:{}".format(host_sock, CONTAINER_SSH_SOCK),
-        "--env", "SSH_AUTH_SOCK={}".format(CONTAINER_SSH_SOCK),
+        "--volume", "{}:{}".format(host_sock, config.CONTAINER_SSH_SOCK),
+        "--env", "SSH_AUTH_SOCK={}".format(config.CONTAINER_SSH_SOCK),
     ]
 
 
@@ -279,12 +246,145 @@ def _host_ssh_sock() -> Optional[str]:
     contract either way.
     """
     if sys.platform == "darwin":
-        return DESKTOP_SSH_SOCK
+        return config.DESKTOP_SSH_SOCK
 
     sock = os.environ.get("SSH_AUTH_SOCK")
     if sock and os.path.exists(sock):
         return sock
     return None
+
+
+def _start_sandbox(
+    session_id: str, epoch: int, repo_url: str, branch: str
+) -> Optional[str]:
+    """Start cursord on whichever runtime is configured.
+
+    Every runtime has the same contract: hand cursord the five environment
+    values it demands, return a handle for the sandboxes row, and return None
+    rather than raise if it could not start.
+    """
+    runtime = _RUNTIMES.get(config.SANDBOX_RUNTIME)
+    if runtime is None:
+        raise ValueError(
+            "unknown SANDBOX_RUNTIME {!r}; expected one of {}".format(
+                config.SANDBOX_RUNTIME, ", ".join(sorted(_RUNTIMES))
+            )
+        )
+    return runtime(session_id, epoch, repo_url, branch)
+
+
+def _cursord_env(
+    session_id: str, epoch: int, repo_url: str, branch: str, control_url: str
+) -> dict:
+    """The five values config.require() refuses to start without.
+
+    Shared by both runtimes so that adding one to the container and
+    forgetting it here is not a way to fail.
+    """
+    return {
+        "SESSION_ID": session_id,
+        "EPOCH": str(epoch),
+        "CONTROL_URL": control_url,
+        "REPO_URL": repo_url,
+        "BRANCH": branch,
+    }
+
+
+# Popen objects for sandboxes this instance started, so an exited one is
+# waited on rather than left a zombie. Purely housekeeping: the handle in the
+# sandboxes row is a pid, so any instance can signal any sandbox without this.
+_PROCESSES: dict = {}
+
+
+def _reap_exited() -> None:
+    for key, process in list(_PROCESSES.items()):
+        if process.poll() is not None:
+            logger.info("cursord %s exited with %s", key, process.returncode)
+            del _PROCESSES[key]
+
+
+def _start_process(
+    session_id: str, epoch: int, repo_url: str, branch: str
+) -> Optional[str]:
+    """Run cursord as a subprocess on this machine. Development only.
+
+    This is not a sandbox. run_command executes as this user, on this
+    filesystem, with this user's ssh keys and this user's access to the
+    control plane's own database. It exists so the loop can be driven
+    end-to-end against a local bare repo without Docker, and the model in
+    that setup is one you are watching.
+    """
+    _reap_exited()
+
+    if not (config.AGENT_DIR / "cursord").is_dir():
+        logger.error(
+            "no cursord package under %s; set SANDBOX_AGENT_DIR", config.AGENT_DIR
+        )
+        return None
+
+    # Per epoch, and cleared first: a rebuild must clone fresh, and prepare()
+    # clones into this path.
+    workspace = config.WORKSPACE_ROOT / session_id / str(epoch)
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env.update(
+        _cursord_env(session_id, epoch, repo_url, branch, config.LOCAL_CONTROL_URL)
+    )
+    env["WORKSPACE"] = str(workspace)
+    env["PYTHONPATH"] = str(config.AGENT_DIR)
+    env["PYTHONUNBUFFERED"] = "1"
+    # Same reasoning as the Dockerfile: without BatchMode a missing key or an
+    # unknown host becomes a prompt on a terminal nobody is attached to, and
+    # the clone hangs instead of failing with a reason.
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+
+    config.LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    log_path = config.LOG_ROOT / "{}.{}.log".format(session_id, epoch)
+
+    command = [
+        "/bin/bash",
+        "-c",
+        # $$ is this shell's pid and exec replaces the shell, so cursord runs
+        # as the pid recorded below and reports the same handle back from
+        # register(). Left alone it falls back to the machine hostname, which
+        # would overwrite the pid with a value nothing can signal.
+        'HOSTNAME="local:$$" exec "$0" -m cursord',
+        sys.executable,
+    ]
+
+    try:
+        with open(log_path, "ab") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=str(config.AGENT_DIR),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                # Its own session, so a control plane restart does not take
+                # the sandbox down with it.
+                start_new_session=True,
+            )
+    except OSError as exc:
+        logger.error(
+            "could not start cursord for session %s epoch %s: %s",
+            session_id,
+            epoch,
+            exc,
+        )
+        return None
+
+    _PROCESSES["{}:{}".format(session_id, epoch)] = process
+    logger.info(
+        "cursord pid %s for session %s epoch %s, logging to %s",
+        process.pid,
+        session_id,
+        epoch,
+        log_path,
+    )
+    return "local:{}".format(process.pid)
 
 
 def _start_container(
@@ -295,7 +395,7 @@ def _start_container(
     Returning None is not fatal: the sandbox row exists at this epoch, so a
     cursord process started by hand can register against it.
     """
-    if not SANDBOX_IMAGE:
+    if not config.SANDBOX_IMAGE:
         logger.warning(
             "SANDBOX_IMAGE is unset; session %s epoch %s has no container",
             session_id,
@@ -308,14 +408,12 @@ def _start_container(
                        session_id, epoch)
         return None
 
-    command = [
-        "docker", "run", "--detach", "--rm",
-        "--env", "SESSION_ID={}".format(session_id),
-        "--env", "EPOCH={}".format(epoch),
-        "--env", "CONTROL_URL={}".format(CONTROL_URL),
-        "--env", "REPO_URL={}".format(repo_url),
-        "--env", "BRANCH={}".format(branch),
-    ]
+    command = ["docker", "run", "--detach", "--rm"]
+    for name, value in _cursord_env(
+        session_id, epoch, repo_url, branch, config.CONTROL_URL
+    ).items():
+        command += ["--env", "{}={}".format(name, value)]
+
     if os.path.isdir(repo_url):
         # The bare repo stands in for GitHub, so the container needs it mounted.
         command += ["--volume", "{}:{}".format(repo_url, repo_url)]
@@ -324,7 +422,7 @@ def _start_container(
         # and the same credentials again to push every checkpoint.
         command += _ssh_arguments()
 
-    command.append(SANDBOX_IMAGE)
+    command.append(config.SANDBOX_IMAGE)
 
     try:
         finished = subprocess.run(
@@ -332,7 +430,7 @@ def _start_container(
             capture_output=True,
             text=True,
             check=True,
-            timeout=SPAWN_TIMEOUT_SECONDS,
+            timeout=config.SPAWN_TIMEOUT_SECONDS,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         stderr = getattr(exc, "stderr", "") or ""
@@ -345,3 +443,10 @@ def _start_container(
         return None
 
     return finished.stdout.strip()[:12] or None
+
+
+# Declared after both, so the table holds the functions rather than their names.
+_RUNTIMES = {
+    "docker": _start_container,
+    "process": _start_process,
+}

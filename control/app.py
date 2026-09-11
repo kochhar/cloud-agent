@@ -192,13 +192,17 @@ def register_sandbox(session_id: str, body: RegisterRequest) -> Dict[str, Any]:
 
 @app.get("/sandbox/{session_id}/next-action")
 def get_next_action(session_id: str, epoch: int = Query(..., ge=0)) -> Dict[str, Any]:
-    """Long-poll for the pending tool call. A null tool means the hold expired."""
-    action = sessions.claim_next_action(session_id, epoch)
-    if action is None:
-        return {"ok": True, "tool": None}
+    """Long-poll for the pending tool call.
+
+    A null tool means the hold expired with nothing pending, unless
+    session_status is terminal, which means the sandbox should exit.
+    """
+    claim = sessions.claim_next_action(session_id, epoch)
+    action = claim["tool"]
     return {
         "ok": True,
-        "tool": {
+        "session_status": claim["session_status"],
+        "tool": None if action is None else {
             "action_id": str(action["id"]),
             "name": action["name"],
             "args": action["args"],

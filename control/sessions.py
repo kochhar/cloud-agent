@@ -7,15 +7,12 @@ from typing import Any
 import uuid
 
 from db import pool
+from models import TERMINAL_STATUSES
+import config
 import llm
 import sandbox
 
 logger = logging.getLogger(__name__)
-
-# Shared by both long-polls: the events feed and the next-action poll. Held
-# under the usual 30s proxy timeout so a poll returns rather than resets.
-LONG_POLL_SECONDS = 25.0
-POLL_INTERVAL_SECONDS = 0.5
 
 
 class SessionNotFound(Exception):
@@ -55,7 +52,7 @@ def get_events(
     session_id: str,
     after: int = 0,
     limit: int = 500,
-    timeout: float = LONG_POLL_SECONDS,
+    timeout: float = config.LONG_POLL_SECONDS,
 ) -> list[dict]:
     """Long-poll the UI feed for events after a sequence number.
 
@@ -85,7 +82,7 @@ def get_events(
             return rows
         if time.monotonic() >= deadline:
             return []
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
 # ---------- ---------- ----------
@@ -158,30 +155,34 @@ def advance(session_id: str) -> None:
 # sandbox-facing API
 # ---------- ---------- ----------
 
-# Each sandbox death re-dispatches the same call. Past this many attempts the
-# session fails rather than spawning containers forever.
-MAX_TOOL_ATTEMPTS = 3
-
-# Results reach the model in full and the UI truncated.
-RESULT_PREVIEW_CHARS = 2000
-
-
 class UnknownAction(Exception):
     pass
 
 
 def claim_next_action(
-    session_id: str, epoch: int, timeout: float = LONG_POLL_SECONDS
-) -> dict | None:
-    """Long-poll for the next tool call. None means the hold expired."""
+    session_id: str, epoch: int, timeout: float = config.LONG_POLL_SECONDS
+) -> dict:
+    """Long-poll for the next tool call.
+
+    Always reports the session status. A null tool on its own is ambiguous —
+    it means both "the model is still thinking" and "there will never be
+    another call" — and a sandbox that cannot tell those apart polls a
+    finished session forever.
+    """
     deadline = time.monotonic() + timeout
     while True:
-        action = _claim_one_action(session_id, epoch)
+        status, action = _claim_one_action(session_id, epoch)
         if action is not None:
-            return action
+            return {"tool": action, "session_status": status}
+
+        # Returned without waiting out the hold: there is nothing to wait for,
+        # and the sooner the sandbox hears this the sooner it stops.
+        if status in TERMINAL_STATUSES:
+            return {"tool": None, "session_status": status}
+
         if time.monotonic() >= deadline:
-            return None
-        time.sleep(POLL_INTERVAL_SECONDS)
+            return {"tool": None, "session_status": status}
+        time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
 def record_action_result(
@@ -343,14 +344,6 @@ def _load_context(cur, session_id: str) -> list[dict]:
     return out
 
 
-def _current_epoch(cur, session_id: str) -> int:
-    cur.execute("SELECT current_epoch FROM sessions WHERE id = %s", (session_id,))
-    row = cur.fetchone()
-    if row is None:
-        raise SessionNotFound(session_id)
-    return row["current_epoch"]
-
-
 def _set_status(cur, session_id: str, status: str, error: str | None = None) -> None:
     cur.execute(
         "UPDATE sessions SET status = %s, error = %s, "
@@ -410,25 +403,48 @@ def _fail(session_id: str, error: str) -> None:
             _set_status(cur, session_id, "failed", error)
 
 
+def _require_current(cur, session_id: str, epoch: int) -> dict:
+    """Status and epoch for a caller that is still the live sandbox.
+
+    Both come from one read so the status a caller acts on is the status that
+    was true when its epoch was checked.
+    """
+    cur.execute(
+        "SELECT status, current_epoch FROM sessions WHERE id = %s", (session_id,)
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise SessionNotFound(session_id)
+    if epoch < row["current_epoch"]:
+        raise StaleEpoch(
+            f"epoch {epoch} is stale, session {session_id} is at "
+            f"epoch {row['current_epoch']}"
+        )
+    return row
+
+
 def _require_current_epoch(cur, session_id: str, epoch: int) -> int:
     """Reject a caller from a sandbox that has already been replaced."""
-    current = _current_epoch(cur, session_id)
-    if epoch < current:
-        raise StaleEpoch(
-            f"epoch {epoch} is stale, session {session_id} is at epoch {current}"
-        )
-    return current
+    return _require_current(cur, session_id, epoch)["current_epoch"]
 
 
-def _claim_one_action(session_id: str, epoch: int) -> dict | None:
+def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
     """Hand the oldest pending call to exactly one caller.
+
+    Returns the session status alongside the claim, because the caller has to
+    tell "nothing pending yet" apart from "nothing will ever be pending".
 
     SKIP LOCKED means two sandboxes polling at the same moment take different
     rows instead of blocking on each other.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            _require_current_epoch(cur, session_id, epoch)
+            status = _require_current(cur, session_id, epoch)["status"]
+            if status in TERMINAL_STATUSES:
+                # A cancelled session can still have pending rows. Claiming
+                # one would hand out work whose result will never be accepted.
+                return status, None
+
             cur.execute(
                 """
                 UPDATE tool_calls
@@ -450,9 +466,9 @@ def _claim_one_action(session_id: str, epoch: int) -> dict | None:
             )
             row = cur.fetchone()
             if row is None:
-                return None
+                return status, None
 
-            if row["attempts"] > MAX_TOOL_ATTEMPTS:
+            if row["attempts"] > config.MAX_TOOL_ATTEMPTS:
                 cur.execute(
                     "UPDATE tool_calls SET status = 'failed', completed_at = now() "
                     "WHERE id = %s",
@@ -464,9 +480,12 @@ def _claim_one_action(session_id: str, epoch: int) -> dict | None:
                     "failed",
                     f"tool call {row['name']} failed after {row['attempts'] - 1} attempts",
                 )
-                return None
+                # Reported as failed rather than as the status read at entry:
+                # this call is what made it terminal, and the sandbox should
+                # exit on this response rather than poll once more to find out.
+                return "failed", None
 
-            return row
+            return status, row
 
 
 def _rejected(cur, session_id: str, action_id: str, epoch: int) -> Exception:
@@ -505,7 +524,7 @@ def _tool_message(call: dict) -> str:
 
 
 def _preview(text: str | None) -> str | None:
-    if text is None or len(text) <= RESULT_PREVIEW_CHARS:
+    if text is None or len(text) <= config.RESULT_PREVIEW_CHARS:
         return text
-    dropped = len(text) - RESULT_PREVIEW_CHARS
-    return text[:RESULT_PREVIEW_CHARS] + f"\n… truncated, {dropped} more characters"
+    dropped = len(text) - config.RESULT_PREVIEW_CHARS
+    return text[:config.RESULT_PREVIEW_CHARS] + f"\n… truncated, {dropped} more characters"
