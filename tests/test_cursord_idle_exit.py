@@ -22,13 +22,15 @@ import unittest
 
 import httpx
 
+from unittest import mock
+
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "agent")
 )
 
 from cursord import config  # noqa: E402
 from cursord.__main__ import work_loop  # noqa: E402
-from cursord.control import Control  # noqa: E402
+from cursord.control import Control, StaleEpoch  # noqa: E402
 
 CONTROL_URL = "http://control.test"
 
@@ -50,6 +52,39 @@ def _scripted(respond):
 
 def _poll(status, tool=None):
     return httpx.Response(200, json={"ok": True, "session_status": status, "tool": tool})
+
+
+class _Finished:
+    """What tools.execute hands back, without a filesystem underneath it."""
+
+    output = "ok"
+    exit_code = 0
+
+
+class _Checkpoint:
+    sha = None
+    preview = None
+    stat = None
+
+
+async def _no_execution(name, args):
+    return _Finished()
+
+
+async def _no_checkpoint(message, base):
+    return _Checkpoint()
+
+
+def _without_a_workspace():
+    """Run the loop's tool branch without a clone to run it in.
+
+    These tests are about when the loop decides to leave, not about what a
+    tool does. Left unpatched, a dispatched call shells out to git in
+    /workspace/repo, which does not exist on the host running the tests.
+    """
+    return mock.patch.multiple(
+        "cursord.tools", execute=_no_execution
+    ), mock.patch.multiple("cursord.workspace", checkpoint=_no_checkpoint)
 
 
 class IdleExitTests(unittest.IsolatedAsyncioTestCase):
@@ -77,18 +112,29 @@ class IdleExitTests(unittest.IsolatedAsyncioTestCase):
             await control.aclose()
 
     async def test_stays_while_the_session_is_working(self):
-        """'executing' with no tool is the ordinary mid-turn poll, not an exit."""
-        config.IDLE_EXIT_SECONDS = 0.05
-        control, calls = _scripted(lambda request: _poll("executing"))
-        task = asyncio.ensure_future(work_loop(control, base="abc123"))
+        """'executing' with no tool is the ordinary mid-turn poll, not an exit.
+
+        The threshold is set below the poll interval, so a loop that counted
+        'executing' as idle would leave on the second answer. Driven to a
+        409 instead of being cancelled, because the assertion is about which
+        way the loop ended: 'idle' returned here would be the bug.
+        """
+        config.IDLE_EXIT_SECONDS = 0.001
+        state = {"polls": 0}
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            state["polls"] += 1
+            if state["polls"] > 5:
+                # Something has to stop a loop that is behaving correctly.
+                return httpx.Response(409, json={"detail": "epoch 1 < epoch 2"})
+            return _poll("executing")
+
+        control, _ = _scripted(respond)
         try:
-            await self._until(lambda: len(calls) >= 5 or task.done())
-            if task.done():
-                self.fail(
-                    "the work loop left a working session: {!r}".format(task.result())
-                )
+            with self.assertRaises(StaleEpoch):
+                await asyncio.wait_for(work_loop(control, base="abc123"), timeout=5)
+            self.assertEqual(state["polls"], 6)
         finally:
-            task.cancel()
             await control.aclose()
 
     async def test_a_session_that_resumes_resets_the_clock(self):
@@ -111,11 +157,13 @@ class IdleExitTests(unittest.IsolatedAsyncioTestCase):
             return _poll("idle")
 
         control, _ = _scripted(respond)
+        no_tools, no_git = _without_a_workspace()
         started = time.monotonic()
         try:
-            reason = await asyncio.wait_for(
-                work_loop(control, base="abc123"), timeout=5
-            )
+            with no_tools, no_git:
+                reason = await asyncio.wait_for(
+                    work_loop(control, base="abc123"), timeout=5
+                )
             elapsed = time.monotonic() - started
             self.assertEqual(reason, "idle")
             self.assertGreaterEqual(
