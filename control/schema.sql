@@ -1,6 +1,5 @@
--- Local Cloud Agent — executable schema.
--- Mirrors docs/schema.sql, minus the illustrative queries at the bottom of that
--- file. Idempotent so it can be applied on every boot.
+-- Local Cloud Agent — the schema, and the only copy of it.
+-- Applied by hand, and written to be safe to apply more than once.
 
 -- gen_random_uuid() is core since Postgres 13, so no pgcrypto extension.
 -- The bundled pgserver build does not ship one.
@@ -193,8 +192,9 @@ CREATE TABLE IF NOT EXISTS events (
 --
 -- Applying this file is a deliberate act — nothing runs it on boot — and it
 -- must land with the code that writes the new values, not before it. The
--- control plane writes 'awaiting_user' until that change ships, and this
--- constraint rejects it.
+-- control plane now writes 'idle', so this section and the code agree; a
+-- deploy that runs the code against an unmigrated database gets a check
+-- violation on the first turn that ends without tool calls.
 -- ---------------------------------------------------------------
 
 -- sessions gains the two columns the diff is served from. The CREATE TABLE

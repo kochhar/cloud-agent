@@ -103,11 +103,16 @@ def use(client: Optional[Client]) -> None:
     _client = client
 
 
-def complete(context: list) -> Reply:
-    """One model turn. An installed client wins, so tests never hit the network."""
+def complete(context: list, session_id: Optional[str] = None) -> Reply:
+    """One model turn. An installed client wins, so tests never hit the network.
+
+    `session_id` is only ever used to label log lines. It is not passed to an
+    installed client, so the Client signature stays one argument and every
+    scripted stub keeps working.
+    """
     if _client is not None:
         return _client(context)
-    return _grok(context)
+    return _grok(context, session_id)
 
 
 # ---------- ---------- ----------
@@ -134,7 +139,7 @@ def _session() -> httpx.Client:
     return _http
 
 
-def _grok(context: list) -> Reply:
+def _grok(context: list, session_id: Optional[str] = None) -> Reply:
     if not config.GROK_API_KEY:
         raise NotConfigured(
             "GROK_API_KEY is unset; put it in .env or install a client with llm.use(...)"
@@ -148,17 +153,51 @@ def _grok(context: list) -> Reply:
     }
     headers = {"Authorization": "Bearer {}".format(config.GROK_API_KEY)}
 
+    # Turns run in the request threadpool, so several can be in the air at
+    # once and their log lines interleave. Every line below carries this, so
+    # a call and its answer can be paired back up.
+    tag = "[{}]".format(session_id[:8] if session_id else "?")
+
     last: Optional[Exception] = None
     for attempt in range(1, config.GROK_MAX_ATTEMPTS + 1):
+        logger.info(
+            "%s grok request  %s attempt %s/%s: %s messages, ~%s chars, %s tools",
+            tag,
+            config.GROK_MODEL,
+            attempt,
+            config.GROK_MAX_ATTEMPTS,
+            len(context),
+            _context_chars(context),
+            len(tools.TOOL_SCHEMAS),
+        )
+
+        started = time.monotonic()
         try:
             response = _session().post(
                 "/chat/completions", json=body, headers=headers
             )
         except httpx.HTTPError as exc:
             last = ProviderError("could not reach the provider: {}".format(exc))
+            logger.warning(
+                "%s grok unreachable after %.1fs: %s", tag, time.monotonic() - started, exc
+            )
         else:
+            elapsed = time.monotonic() - started
+
             if response.status_code == 200:
-                return _parse(response.json())
+                payload = response.json()
+                reply = _parse(payload)
+                # The elapsed time is the number that matters here: a turn
+                # outlasting the sandbox's read timeout is what makes cursord
+                # retry a result the control plane already took.
+                logger.info(
+                    "%s grok response %s in %.1fs: %s",
+                    tag,
+                    config.GROK_MODEL,
+                    elapsed,
+                    _describe(payload, reply),
+                )
+                return reply
 
             # The body carries the reason; the key is only in the request
             # headers, so this is safe to log and to surface to the client.
@@ -166,13 +205,21 @@ def _grok(context: list) -> Reply:
             last = ProviderError(
                 "provider returned {}: {}".format(response.status_code, detail)
             )
+            logger.warning(
+                "%s grok response %s in %.1fs: %s",
+                tag,
+                response.status_code,
+                elapsed,
+                detail,
+            )
             if response.status_code not in _RETRY_STATUSES:
                 break
 
         if attempt < config.GROK_MAX_ATTEMPTS:
             delay = _backoff(attempt)
             logger.warning(
-                "grok attempt %s/%s failed (%s); retrying in %.1fs",
+                "%s grok attempt %s/%s failed (%s); retrying in %.1fs",
+                tag,
                 attempt,
                 config.GROK_MAX_ATTEMPTS,
                 last,
@@ -181,6 +228,41 @@ def _grok(context: list) -> Reply:
             time.sleep(delay)
 
     raise last if last else ProviderError("no attempt was made")
+
+
+def _context_chars(context: list) -> int:
+    """Roughly how much is going up. Sizes only, never the content itself."""
+    return sum(len(message.get("content") or "") for message in context)
+
+
+def _describe(payload: dict, reply: Reply) -> str:
+    """What came back, in sizes and counts rather than text."""
+    choice = (payload.get("choices") or [{}])[0]
+    parts = ["finish={}".format(choice.get("finish_reason") or "?")]
+
+    if reply.tool_calls:
+        parts.append(
+            "{} tool calls ({})".format(
+                len(reply.tool_calls),
+                ", ".join(call.name for call in reply.tool_calls),
+            )
+        )
+    else:
+        parts.append("no tool calls")
+
+    if reply.text:
+        parts.append("{} chars text".format(len(reply.text)))
+    if reply.reasoning:
+        parts.append("{} chars reasoning".format(len(reply.reasoning)))
+
+    usage = payload.get("usage") or {}
+    if usage:
+        parts.append(
+            "tokens {}+{}".format(
+                usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?")
+            )
+        )
+    return ", ".join(parts)
 
 
 def _backoff(attempt: int) -> float:

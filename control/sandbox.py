@@ -30,11 +30,19 @@ class SandboxNotRegistered(Exception):
     """A heartbeat arrived for an epoch that has no sandbox row."""
 
 
-# Reasons a sandbox can stop with nothing wrong. Anything else it reports on
-# the way out is a sandbox that stopped early, which is the reaper's problem
-# even though this one was polite enough to say so. The sandbox reports what
-# happened; deciding whether that needs a replacement is not its call.
-CLEAN_EXITS = frozenset({"session_finished"})
+# Reasons a sandbox can stop with nothing wrong, matching what cursord sends
+# from __main__.main. Anything else it reports on the way out is a sandbox
+# that stopped early, which is the reaper's problem even though this one was
+# polite enough to say so. The sandbox reports what happened; deciding
+# whether that needs a replacement is not its call.
+#
+#   idle              the session finished its turn and nobody came back
+#   session_finished  the session reached 'failed' or 'cancelled'
+#
+# 'idle' has to be here. It is the ordinary end of a conversation, and
+# reading it as a crash would have the reaper replace a sandbox that left
+# because there was nothing to do — which would go idle and leave again.
+CLEAN_EXITS = frozenset({"idle", "session_finished"})
 
 
 def spawn(session_id: str) -> dict:

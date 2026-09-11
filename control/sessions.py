@@ -7,7 +7,7 @@ from typing import Any, Callable
 import uuid
 
 from db import pool
-from models import IDLE, TERMINAL_STATUSES
+from models import EXECUTING, FAILED, IDLE, THINKING, TERMINAL_STATUSES
 import config
 import llm
 import sandbox
@@ -37,8 +37,8 @@ def create_session(repo_url: str, prompt:str) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO sessions (repo_url, branch, status) "
-                "VALUES (%s, %s, 'idle') RETURNING id, branch",
-                (repo_url, branch),
+                "VALUES (%s, %s, %s) RETURNING id, branch",
+                (repo_url, branch, IDLE),
             )
 
             row = cur.fetchone()
@@ -218,7 +218,7 @@ def advance(session_id: str) -> None:
     # Deliberately outside any transaction: this is a network call that can
     # take a minute, and nothing should sit locked while it runs.
     try:
-        reply = llm.complete(context)
+        reply = llm.complete(context, session_id)
     except Exception as exc:
         # Recorded on the session, so the handler that triggered the advance 
         # still returns and the client learns about it from the event feed.
@@ -243,7 +243,7 @@ def advance(session_id: str) -> None:
                 _emit(cur, session_id, "thinking", {"text": reply.reasoning})
 
             if not reply.tool_calls:
-                _set_status(cur, session_id, "idle")
+                _set_status(cur, session_id, IDLE)
 
                 # A user message which arrived while we were in the model call
                 # is not answered. Nothing is going to notice: add_user_message 
@@ -264,7 +264,7 @@ def advance(session_id: str) -> None:
                             "args": call.args,
                         },
                     )
-                _set_status(cur, session_id, "executing")
+                _set_status(cur, session_id, EXECUTING)
 
     if unanswered:
         advance(session_id)
@@ -356,10 +356,6 @@ def record_action_result(
             row = cur.fetchone()
                      
             if row is None:
-                # cursord retries a result until it gets an answer, and the
-                # model call this request triggers can easily outlast its
-                # client timeout. A second report of a result already
-                # accepted at this epoch is that retry, not an error.
                 if _already_accepted(cur, session_id, action_id, epoch):
                     logger.info(
                         "duplicate result for tool call %s on session %s, "
@@ -367,16 +363,9 @@ def record_action_result(
                         action_id,
                         session_id,
                     )
-                    # Not advancing: the first report already did, and doing
-                    # it again would call the model a second time on the
-                    # same context.
                     return {"batch_complete": False}
                 raise _rejected(cur, session_id, action_id, epoch)
 
-            # Both come from the sandbox, which is the only side holding a
-            # clone. base_sha is whatever the first sandbox cloned and never
-            # moves after that; COALESCE keeps a later epoch, which starts
-            # from a resume point rather than the base, from overwriting it.
             cur.execute(
                 "UPDATE sessions SET base_sha = COALESCE(base_sha, %s), "
                 "updated_at = now() WHERE id = %s",
@@ -539,9 +528,9 @@ def _load_context(cur, session_id: str) -> list[dict]:
 def _set_status(cur, session_id: str, status: str, error: str | None = None) -> None:
     cur.execute(
         "UPDATE sessions SET status = %s, error = %s, "
-        "thinking_since = CASE WHEN %s = 'thinking' THEN now() ELSE NULL END, "
+        "thinking_since = CASE WHEN %s = %s THEN now() ELSE NULL END, "
         "updated_at = now() WHERE id = %s",
-        (status, error, status, session_id),
+        (status, error, status, THINKING, session_id),
     )
     payload = {"status": status}
     if error:
@@ -576,23 +565,27 @@ def _claim_thinking(session_id: str) -> bool:
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
+            # Parameterised rather than inlined because this is the one place
+            # a status that stopped matching would be silent: no row, no
+            # error, and advance() quietly becomes a session that never
+            # thinks again.
             cur.execute(
-                "UPDATE sessions SET status = 'thinking', thinking_since = now(), "
+                "UPDATE sessions SET status = %s, thinking_since = now(), "
                 "updated_at = now() "
-                "WHERE id = %s AND status IN ('idle', 'executing') "
+                "WHERE id = %s AND status IN (%s, %s) "
                 "RETURNING id",
-                (session_id,),
+                (THINKING, session_id, IDLE, EXECUTING),
             )
             if cur.fetchone() is None:
                 return False
-            _emit(cur, session_id, "status", {"status": "thinking"})
+            _emit(cur, session_id, "status", {"status": THINKING})
             return True
 
 
 def _fail(session_id: str, error: str) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            _set_status(cur, session_id, "failed", error)
+            _set_status(cur, session_id, FAILED, error)
 
 
 def _require_current(cur, session_id: str, epoch: int) -> dict:
@@ -673,13 +666,13 @@ def _claim_one_action(session_id: str, epoch: int) -> tuple[str, dict | None]:
                 _set_status(
                     cur,
                     session_id,
-                    "failed",
+                    FAILED,
                     f"tool call {row['name']} failed after {row['attempt'] - 1} attempts",
                 )
                 # Reported as failed rather than as the status read at entry:
                 # this call is what made it terminal, and the sandbox should
                 # exit on this response rather than poll once more to find out.
-                return "failed", None
+                return FAILED, None
 
             return status, row
 
