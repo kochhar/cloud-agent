@@ -77,7 +77,13 @@ def spawn(session_id: str) -> dict:
             
             row = cur.fetchone()
             if row is None:
-                raise _refusal(cur, session_id)
+                # Either the id is unknown or the session is already finished.
+                # Not worth a second query to tell them apart: the only caller
+                # is create_session, which just inserted the row, so in
+                # practice this is always a terminal session.
+                raise SpawnRefused(
+                    f"session {session_id} cannot take a new sandbox"
+                )
 
             epoch = row["current_epoch"]
             repo_url = row["repo_url"]
@@ -206,15 +212,6 @@ def _resolve_base_sha(repo_url: str) -> Optional[str]:
 
     fields = finished.stdout.split()
     return fields[0] if fields else None
-
-
-def _refusal(cur, session_id: str) -> Exception:
-    """Turn a no-op UPDATE into the reason it did not apply."""
-    cur.execute("SELECT status FROM sessions WHERE id = %s", (session_id,))
-    row = cur.fetchone()
-    if row is None:
-        return sessions.SessionNotFound(session_id)
-    return SpawnRefused("session {} is {}".format(session_id, row["status"]))
 
 
 def _ssh_arguments() -> list:

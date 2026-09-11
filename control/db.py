@@ -1,13 +1,7 @@
-import os
-
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://postgres@127.0.0.1:5432/project1",
-)
+from config import DATABASE_URL
 
 # dict_row for every connection, so callers get mappings rather than tuples.
 pool = ConnectionPool(
