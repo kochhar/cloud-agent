@@ -92,76 +92,6 @@ def add_user_message(session_id: str, content: str) -> dict:
     return {"advanced": False}
 
 
-def get_diff(session_id: str) -> dict:
-    """What changed, in summary, and where to read the rest of it.
-
-    A read and nothing else. Everything here was computed in the sandbox,
-    which is the only side of this system holding a clone, and written
-    alongside the SHA it describes when that result was accepted. So it
-    answers after the sandbox is gone and from an instance that has never
-    seen the repository.
-
-    The full patch is deliberately not here. It lives in the repository the
-    sandbox pushed to, and `url` is how a client gets to it.
-    """
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT repo_url, branch, base_sha, last_accepted_sha, "
-                "diff_preview, diff_stat, status FROM sessions WHERE id = %s",
-                (session_id,),
-            )
-            row = cur.fetchone()
-
-    if row is None:
-        raise SessionNotFound(session_id)
-
-    base = row["base_sha"]
-    head = row["last_accepted_sha"]
-    stat = row["diff_stat"] or {}
-
-    return {
-        "branch": row["branch"],
-        "status": row["status"],
-        "base_sha": base,
-        "head_sha": head,
-        # No accepted commit means no sandbox has reported one: every tool
-        # call so far was a read, or none has finished. Empty, not absent, so
-        # a client can render it without branching.
-        "files": stat.get("files", []),
-        "files_changed": stat.get("files_changed", 0),
-        "additions": stat.get("additions", 0),
-        "deletions": stat.get("deletions", 0),
-        "files_truncated": stat.get("files_truncated", False),
-        "preview": row["diff_preview"] or "",
-        "preview_truncated": stat.get("preview_truncated", False),
-        "url": _compare_url(row["repo_url"], base, head),
-    }
-
-
-def _compare_url(repo_url: str, base: str | None, head: str | None) -> str | None:
-    """A link to the full patch on the forge hosting the repo.
-
-    Nothing here fetches anything; it is a string rewrite of the remote we
-    were given. None for a local bare repo or a host we have no URL shape
-    for, which a client should read as "the preview is all there is".
-    """
-    if not base or not head or base == head:
-        return None
-
-    # scp-style (git@host:owner/repo) and URL forms both reduce to a host and
-    # a path, and neither has a scheme worth keeping.
-    remainder = repo_url.split("://", 1)[-1].rsplit("@", 1)[-1]
-    host, separator, path = remainder.partition(":" if ":" in remainder.split("/")[0] else "/")
-    if not separator:
-        return None
-
-    template = config.COMPARE_URLS.get(host)
-    if template is None:
-        return None
-    return template.format(repo=path.strip("/").removesuffix(".git"), base=base, head=head)
-
-
 def get_events(
     session_id: str,
     after: int = 0,
@@ -199,6 +129,68 @@ def get_events(
         time.sleep(config.POLL_INTERVAL_SECONDS)
 
 
+
+def get_diff(session_id: str) -> dict:
+    """What changed, in summary, and where to read the rest of it.
+
+    A read, diff was computed in the sandbox,  and written alongside the SHA 
+    it describes when that result was accepted.
+
+    The full patch is not here. It lives in the repository the sandbox pushed to, 
+    and `url` is how a client gets to it.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT repo_url, branch, base_sha, last_accepted_sha, "
+                "diff_preview, diff_stat, status FROM sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        raise SessionNotFound(session_id)
+
+    base = row["base_sha"]
+    head = row["last_accepted_sha"]
+    stat = row["diff_stat"] or {}
+
+    return {
+        "branch": row["branch"],
+        "status": row["status"],
+        "base_sha": base,
+        "head_sha": head,
+        # No accepted commit means no sandbox has reported one: Empty, not 
+        # absent, so client can render without branching.
+        "files": stat.get("files", []),
+        "files_changed": stat.get("files_changed", 0),
+        "additions": stat.get("additions", 0),
+        "deletions": stat.get("deletions", 0),
+        "files_truncated": stat.get("files_truncated", False),
+        "preview": row["diff_preview"] or "",
+        "preview_truncated": stat.get("preview_truncated", False),
+        "url": _compare_url(row["repo_url"], base, head),
+    }
+
+
+def _compare_url(repo_url: str, base: str | None, head: str | None) -> str | None:
+    """A link to the full patch on the forge hosting the repo."""
+    if not base or not head or base == head:
+        return None
+
+    # scp-style (git@host:owner/repo) and URL forms both reduce to a host and
+    # a path, and neither has a scheme worth keeping.
+    remainder = repo_url.split("://", 1)[-1].rsplit("@", 1)[-1]
+    host, separator, path = remainder.partition(":" if ":" in remainder.split("/")[0] else "/")
+    if not separator:
+        return None
+
+    template = config.COMPARE_URLS.get(host)
+    if template is None:
+        return None
+    return template.format(repo=path.strip("/").removesuffix(".git"), base=base, head=head)
+
+
 # ---------- ---------- ----------
 # the loop
 # ---------- ---------- ----------
@@ -215,13 +207,13 @@ def advance(session_id: str) -> None:
         with conn.cursor() as cur:
             context = _load_context(cur, session_id)
 
-    # Deliberately outside any transaction: this is a network call that can
-    # take a minute, and nothing should sit locked while it runs.
+    # Deliberately outside transaction: this can take a minute, and nothing 
+    # should sit locked while it runs.
     try:
-        reply = llm.complete(context, session_id)
+        reply = llm.complete(context)
     except Exception as exc:
-        # Recorded on the session, so the handler that triggered the advance 
-        # still returns and the client learns about it from the event feed.
+        # Recorded on the session, so the handler still returns and the client 
+        # learns about it from the event feed.
         logger.exception("model call failed for session %s", session_id)
         _fail(session_id, f"model call failed: {exc}")
         return
@@ -246,9 +238,8 @@ def advance(session_id: str) -> None:
                 _set_status(cur, session_id, IDLE)
 
                 # A user message which arrived while we were in the model call
-                # is not answered. Nothing is going to notice: add_user_message 
-                # saw a busy session and left the nudge to us to handle after 
-                # the call finishes.
+                # is not answered. add_user_message saw a busy session and left 
+                # the nudge to us to handle after the call finishes.
                 unanswered = _last_message_role(cur, session_id) == "user"
             else:
                 unanswered = False
@@ -326,12 +317,12 @@ def record_action_result(
     content rather than failing the call.
 
     `schedule` is how the caller runs work after it has answered its own
-    client. 
+    client. A model turn is unbounded and cursord's read timeout is 35s, 
+    so advancing inside the request makes it give up and retry a result 
+    that was already accepted. 
     
-    A model turn is unbounded — 82s has been observed — and cursord's
-    read timeout is 35s, so advancing inside the request makes it give up and
-    retry a result that was already accepted. Called inline when no scheduler
-    is offered, which is what direct callers and tests want.
+    Called inline when no scheduler is offered, which is what direct callers 
+    and tests want.
     """
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -349,7 +340,7 @@ def record_action_result(
                    AND session_id = %s
                    AND status = 'dispatched'
                    AND epoch = (SELECT current_epoch FROM sessions WHERE id = %s)
-                RETURNING id, name, message_id, exit_code, commit_sha, repeated
+                RETURNING id AS action_id, name, message_id, exit_code, commit_sha, repeated AS repeated
                 """,
                 (result, exit_code, commit_sha, action_id, session_id, session_id),
             )
@@ -371,13 +362,7 @@ def record_action_result(
                 "updated_at = now() WHERE id = %s",
                 (base_sha, session_id),
             )
-
             if commit_sha:
-                # Only a SHA from a live epoch may move the branch head, and
-                # the summary moves with it in the same statement so it can
-                # never end up describing a commit other than the one here.
-                # Clamped again on this side: the cap is the column's, and a
-                # sandbox is not the thing that gets to decide it.
                 cur.execute(
                     "UPDATE sessions SET last_accepted_sha = %s, "
                     "diff_preview = %s, diff_stat = %s, updated_at = now() "
@@ -390,19 +375,8 @@ def record_action_result(
                     ),
                 )
 
-            _emit(
-                cur,
-                session_id,
-                "tool_finished",
-                {
-                    "action_id": str(row["id"]),
-                    "name": row["name"],
-                    "exit_code": row["exit_code"],
-                    "commit_sha": row["commit_sha"],
-                    "repeated": row["repeated"],
-                    "result": _preview(result),
-                },
-            )
+            row["result"] = _preview(result)
+            _emit(cur, session_id, "tool_finished", row)
 
             cur.execute(
                 "SELECT count(*) AS open FROM tool_calls "
