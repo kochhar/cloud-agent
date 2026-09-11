@@ -5,7 +5,7 @@ any of this: git is not in the tool schema, so model-authored commits cannot
 collide with checkpointing.
 
 The invariant: when a tool call's result is accepted by the control plane, the
-file state that produced it is already in the bare repo under the SHA reported
+file state that produced it is already on the remote under the SHA reported
 alongside it. Push happens before report, always. The cost of that ordering is
 that a container dying in between leaves a pushed commit nobody accepted,
 which is exactly what `reset_to` throws away on the next spawn.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -113,13 +114,40 @@ async def checkpoint(message: str, base: str) -> Optional[Checkpoint]:
     if not staged.strip():
         return None
 
+    commit_started = time.monotonic()
     await git("commit", "--quiet", "--message", message)
     sha = (await git("rev-parse", "HEAD")).strip()
+    logger.info(
+        "git commit %s",
+        sha[:12],
+        extra={
+            "event": "git_commit_finished",
+            "duration_ms": round((time.monotonic() - commit_started) * 1000, 3),
+        },
+    )
 
     # Force, because we may be sitting behind a zombie's push. The control
     # plane's last_accepted_sha is the authority on the branch, not the tip.
-    await git("push", "--force", "origin", f"HEAD:refs/heads/{config.BRANCH}")
-    logger.info("checkpoint %s", sha[:12])
+    push_started = time.monotonic()
+    try:
+        await git("push", "--force", "origin", f"HEAD:refs/heads/{config.BRANCH}")
+    except GitError:
+        logger.exception(
+            "git push failed",
+            extra={
+                "event": "git_push_failed",
+                "duration_ms": round((time.monotonic() - push_started) * 1000, 3),
+            },
+        )
+        raise
+    logger.info(
+        "checkpoint %s",
+        sha[:12],
+        extra={
+            "event": "git_push_finished",
+            "duration_ms": round((time.monotonic() - push_started) * 1000, 3),
+        },
+    )
 
     # Against the base, not against the previous commit: the control plane
     # replaces what it holds each time, so every checkpoint has to describe

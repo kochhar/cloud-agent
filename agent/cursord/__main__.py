@@ -25,13 +25,10 @@ import socket
 import sys
 import time
 
-from . import config, tools, workspace
-from .control import Control, SessionFinished, StaleEpoch
+from . import config, log_context, tools, workspace
+from .control import Control, SessionFinished, SessionGone, StaleEpoch
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s cursord[e{}] %(levelname)s %(message)s".format(config.EPOCH),
-)
+log_context.configure()
 logger = logging.getLogger("cursord")
 
 
@@ -73,7 +70,7 @@ async def work_loop(control: Control, base: str) -> str:
 
     Returns the reason this container is done, which is only ever that the
     session has been idle too long. Every other ending is a raise: a stale
-    epoch, or a session that closed.
+    epoch, a session that closed, or a session that no longer exists.
 
     An idle session has finished its turn and is waiting on a person, which
     is a wait with no upper bound. Everything this container holds is
@@ -111,29 +108,41 @@ async def work_loop(control: Control, base: str) -> str:
         idle_since = None
         action = poll.tool
 
-        logger.info(
-            "action %s %s%s",
-            action.name,
-            action.action_id[:8],
-            " (repeat)" if action.repeated else "",
-        )
+        with log_context.bind(action.action_id, action.attempt):
+            logger.info(
+                "action %s%s",
+                action.name,
+                " (repeat)" if action.repeated else "",
+                extra={"event": "tool_execution_started"},
+            )
 
-        result = await tools.execute(action.name, action.args)
+            started = time.monotonic()
+            result = await tools.execute(action.name, action.args)
+            logger.info(
+                "action %s finished with exit code %s",
+                action.name,
+                result.exit_code,
+                extra={
+                    "event": "tool_execution_finished",
+                    "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                    "exit_code": result.exit_code,
+                },
+            )
 
-        # Push before report, never the other way round. The control plane
-        # must never accept a result whose file state is not already durable.
-        point = await workspace.checkpoint(
-            f"{action.name} {action.action_id[:8]} (epoch {config.EPOCH})",
-            base,
-        )
+            # Push before report, never the other way round. The control plane
+            # must never accept a result whose file state is not already durable.
+            point = await workspace.checkpoint(
+                f"{action.name} {action.action_id[:8]} (epoch {config.EPOCH})",
+                base,
+            )
 
-        await control.report_result(
-            action.action_id,
-            result=result.output,
-            exit_code=result.exit_code,
-            base_sha=base,
-            checkpoint=point,
-        )
+            await control.report_result(
+                action.action_id,
+                result=result.output,
+                exit_code=result.exit_code,
+                base_sha=base,
+                checkpoint=point,
+            )
 
 
 async def main() -> int:
@@ -159,10 +168,24 @@ async def main() -> int:
 
         heartbeat = asyncio.create_task(heartbeat_loop(control))
 
+        prepare_started = time.monotonic()
         head = await workspace.prepare(
             registration.repo_url, registration.branch, registration.resume_sha
         )
-        logger.info("workspace ready at %s", head[:12])
+        logger.info(
+            "workspace ready at %s",
+            head[:12],
+            extra={
+                "event": (
+                    "workspace_recovery_ready"
+                    if registration.resume_sha
+                    else "workspace_first_boot_ready"
+                ),
+                "duration_ms": round(
+                    (time.monotonic() - prepare_started) * 1000, 3
+                ),
+            },
+        )
 
         # On a first spawn the control plane has no base_sha and no way to
         # get one: it holds no clone. This container does, so the base is
@@ -194,6 +217,13 @@ async def main() -> int:
         # and the control plane is the side that decided this.
         farewell = None
         logger.warning("epoch %s is stale (%s); shutting down", config.EPOCH, exc)
+        return 0
+    except SessionGone as exc:
+        # There is nothing on the other side to attach to or to tell. Without
+        # this the daemon retries the 404 forever, which is a process holding
+        # a machine open to poll a session that no longer exists.
+        farewell = None
+        logger.warning("session %s is gone (%s); shutting down", config.SESSION_ID, exc)
         return 0
     except SessionFinished as exc:
         # The one shutdown that is not a failure, and the only reason the

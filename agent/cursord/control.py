@@ -24,6 +24,16 @@ class StaleEpoch(Exception):
     """This container has been replaced. Unwind and exit."""
 
 
+class SessionGone(Exception):
+    """The control plane has no record of what this container is attached to.
+
+    A 404 from this API is the session, the sandbox row, or the tool call
+    being missing, and none of the three come back: the row was deleted, or
+    the database it lived in was. Retrying is what turns that into a daemon
+    that polls a dead session forever.
+    """
+
+
 class SessionFinished(Exception):
     """The session reached a terminal state. Nothing left to do."""
 
@@ -91,6 +101,11 @@ class Control:
         Retried until it succeeds: the container can easily win the race
         against the control plane instance that spawned it, and a connection
         refused here is a timing artifact rather than a failure.
+
+        A 404 is not one of those. `spawn` commits the session and sandbox
+        rows before it starts this process, so a session the control plane
+        cannot find is one that has been deleted, and no amount of asking
+        again will bring it back.
         """
         body = await self._retrying(
             "register",
@@ -109,11 +124,12 @@ class Control:
     async def heartbeat(self) -> bool:
         """Liveness. True if the beat landed.
 
-        A 409 raises StaleEpoch: a newer sandbox owns the session, and that
-        is the one heartbeat failure that means something. Every other
-        failure — a control plane restarting, a 5xx, a timeout — is reported
-        back rather than raised, because the caller is a loop and taking the
-        container down over it would throw away work in flight.
+        A 409 raises StaleEpoch and a 404 raises SessionGone: a newer sandbox
+        owns the session, or there is no longer a session to own. Those are
+        the heartbeat failures that mean something. Every other failure — a
+        control plane restarting, a 5xx, a timeout — is reported back rather
+        than raised, because the caller is a loop and taking the container
+        down over it would throw away work in flight.
 
         Not routed through `_retrying` on purpose. A heartbeat is only worth
         anything at the moment it is sent; resending a stale one says nothing
@@ -153,7 +169,7 @@ class Control:
                     },
                 )
             )
-        except (httpx.HTTPError, StaleEpoch) as exc:
+        except (httpx.HTTPError, StaleEpoch, SessionGone) as exc:
             logger.debug("exit report failed: %s", exc)
 
     # -- work --------------------------------------------------------------
@@ -231,7 +247,23 @@ class Control:
     async def _request(self, awaitable) -> dict:
         response = await awaitable
         if response.status_code == 409:
+            logger.warning(
+                "control plane rejected stale daemon request",
+                extra={
+                    "event": "stale_epoch_received",
+                    "status_code": response.status_code,
+                },
+            )
             raise StaleEpoch(_detail(response))
+        if response.status_code == 404:
+            logger.warning(
+                "control plane has no record of this sandbox",
+                extra={
+                    "event": "session_gone_received",
+                    "status_code": response.status_code,
+                },
+            )
+            raise SessionGone(_detail(response))
         response.raise_for_status()
         return response.json()
 
@@ -246,7 +278,7 @@ class Control:
         while True:
             try:
                 return await self._request(build())
-            except (StaleEpoch, SessionFinished):
+            except (StaleEpoch, SessionFinished, SessionGone):
                 raise
             except (httpx.HTTPError, httpx.HTTPStatusError) as exc:
                 logger.warning("%s failed, retrying in %.1fs: %s", what, delay, exc)
