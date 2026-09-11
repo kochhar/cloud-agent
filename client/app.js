@@ -476,6 +476,11 @@ function clearPane() {
   // turn has ended, and this pane has no session at all.
   setStatus("no session");
   setLive(false);
+  // Drop the query so a refresh does not reopen what we just left, and so
+  // this tab stops looking like it is still on a session another tab owns.
+  if (new URLSearchParams(location.search).has("session")) {
+    history.replaceState(null, "", location.pathname);
+  }
 }
 
 function setStatus(status) {
@@ -657,7 +662,7 @@ setLive(false);
 checkHealth();
 openRequestedSession();
 
-// A session opened in another tab, or left running when this one was closed,
-// is picked back up rather than lost.
-const [latest] = store.sessions;
-if (latest) select(latest);
+// A refresh or a follow-link carries ?session= and is opened above. A bare
+// /ui/ load used to pick the latest entry in localStorage instead, which is
+// shared across tabs, so opening one session rewrote every other tab's URL
+// the next time that tab loaded. The sidebar is how you pick one up.
