@@ -92,7 +92,14 @@ class Control:
         )
 
     async def heartbeat(self) -> None:
-        """Liveness. Raises StaleEpoch when the control plane has moved on."""
+        """Liveness. Raises StaleEpoch when the control plane has moved on.
+
+        Deliberately not wrapped in `_retrying`: a heartbeat that has to be
+        retried is stale by the time it lands, and the next tick is a better
+        answer than a backed-off resend of the last one. Transport and status
+        errors are raised for the caller to absorb, which `heartbeat_loop`
+        does — only StaleEpoch is allowed to end the process.
+        """
         await self._request(
             self._http.post(f"{self._base}/heartbeat", json={"epoch": config.EPOCH})
         )

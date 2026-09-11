@@ -33,6 +33,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cursord")
 
+# Consecutive heartbeat failures between log lines, once the first is out.
+_HEARTBEAT_LOG_EVERY = 20
+
 
 async def heartbeat_loop(control: Control) -> None:
     """Say we are alive until we are told we are not.
@@ -40,9 +43,39 @@ async def heartbeat_loop(control: Control) -> None:
     Started before the clone: a large repo can take longer than the death
     threshold, and a sandbox reaped while still cloning never gets to do
     anything.
+
+    A failed heartbeat is not a reason to stop. The control plane restarting
+    is routine, and the work loop already treats it that way; a sandbox that
+    exited on a single 500 would throw away a tool call in progress because
+    an instance on the other side happened to be redeploying. Missing
+    heartbeats is already a condition the design handles — the reaper spawns
+    a replacement and this container learns it has been replaced the next
+    time a request of any kind returns 409.
+
+    StaleEpoch is the one exception, and it is not really an error: it is the
+    control plane answering. Everything else, transport or status, is retried
+    until it either succeeds or turns into that answer.
     """
+    failures = 0
     while True:
-        await control.heartbeat()
+        try:
+            await control.heartbeat()
+        except StaleEpoch:
+            raise
+        except Exception as exc:  # noqa: BLE001 - liveness must outlive them
+            failures += 1
+            # Loud once, then occasional. At a three second interval an
+            # outage would otherwise produce twenty lines a minute, and the
+            # useful signal is the first failure and the recovery.
+            if failures == 1 or failures % _HEARTBEAT_LOG_EVERY == 0:
+                logger.warning(
+                    "heartbeat failed (%s consecutive): %s", failures, exc
+                )
+        else:
+            if failures:
+                logger.info("heartbeat recovered after %s failure(s)", failures)
+                failures = 0
+
         await asyncio.sleep(config.HEARTBEAT_INTERVAL)
 
 
